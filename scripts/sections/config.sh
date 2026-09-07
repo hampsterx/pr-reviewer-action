@@ -315,7 +315,14 @@ ESCALATE_ON_TOOL_PLANNING_FAILURE="$(printf '%s' "$ESCALATE_ON_TOOL_PLANNING_FAI
 ESCALATE_ON_DIRTY_BASELINE="$(printf '%s' "$ESCALATE_ON_DIRTY_BASELINE" | tr '[:upper:]' '[:lower:]')"
 BASELINE_CLEAN="$(printf '%s' "$BASELINE_CLEAN" | tr '[:upper:]' '[:lower:]')"
 
-if [[ -n "$AI_FALLBACK_BASE_URL" && -z "$AI_FALLBACK_MODEL" ]]; then
+# The fallback endpoint/format/key inherit from the primary when the caller leaves them
+# blank (action.yml), so AI_FALLBACK_BASE_URL is non-empty here even for a caller that
+# configured no fallback at all. Nothing in the resolved environment records whether the
+# value was supplied or inherited, so a URL matching the primary is treated as inherited
+# and AI_FALLBACK_MODEL is what gates the tier -- the same principle as the smart route
+# ("ai_smart_model alone is the gate", classification.sh). A URL that differs from the
+# primary was chosen separately, so a missing model there is still an error.
+if [[ -n "$AI_FALLBACK_BASE_URL" && -z "$AI_FALLBACK_MODEL" && "$AI_FALLBACK_BASE_URL" != "$AI_BASE_URL" ]]; then
   error "AI_FALLBACK_MODEL is required when AI_FALLBACK_BASE_URL is set"
   exit 1
 fi
