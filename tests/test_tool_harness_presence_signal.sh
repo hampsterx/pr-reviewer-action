@@ -31,7 +31,8 @@ python3 - "$SCRIPT_DIR/sections/corpus.sh" "$BLOCK" <<'PY'
 import re, sys
 src = open(sys.argv[1]).read()
 m = re.search(
-    r"^(case \"\$\(printf '%s' \"\$TOOL_MODE\".*?tool-harness\.md.*?^esac)$",
+    r"^(case \"\$\(printf '%s' \"\$TOOL_MODE\".*?tool-harness\.md.*?^esac\n"
+    r"\nif \[ ! -f tool-harness\.json \]; then\n.*?^fi)$",
     src, re.S | re.M,
 )
 if not m:
@@ -98,6 +99,45 @@ OUT="$( cd "$WORK"
   default_tool_harness
   printf 'body=[%s]' "$(cat tool-harness.md)" )"
 check_contains "real output is preserved" "$OUT" "body=[real harness output]"
+
+echo "=== off resets a stale JSON artifact, not just the Markdown ==="
+# The reused-workspace case for the JSON half. escalation.py reads planning_error
+# and error out of this file and the step summary reports its counts, usage and
+# evidence digest, so a file left by an earlier native_loop run would escalate a
+# review that ran no tools and attribute the previous run's telemetry to it.
+OUT="$( cd "$WORK"
+  rm -f tool-harness.md
+  cat > tool-harness.json <<'STALE'
+{"mode":"native_loop","planned_request_count":7,"executed_request_count":4,
+ "tool_results":[{"tool":"read_file","status":"error"}],
+ "planning_error":"boom","error":"execution failed",
+ "usage":{"prompt_tokens":91234,"completion_tokens":2048,"cache_hit_ratio":0.62},
+ "evidence_digest":"carried over from the previous review"}
+STALE
+  TOOL_MODE="off"
+  default_tool_harness
+  printf 'json=[%s]' "$(tr -d ' \n' < tool-harness.json)" )"
+check_contains "stale planning_error is gone" "$OUT" '"mode":"off"'
+[ "${OUT#*planning_error}" = "$OUT" ] \
+  && { echo "  PASS: stale planning_error cleared"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL: stale planning_error survived off mode"; FAIL=$((FAIL+1)); }
+[ "${OUT#*evidence_digest}" = "$OUT" ] \
+  && { echo "  PASS: stale evidence digest cleared"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL: stale evidence digest survived off mode"; FAIL=$((FAIL+1)); }
+[ "${OUT#*\"executed_request_count\":4}" = "$OUT" ] \
+  && { echo "  PASS: stale call counts cleared"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL: stale call counts survived off mode"; FAIL=$((FAIL+1)); }
+
+echo "=== native_loop keeps a JSON artifact it did not write ==="
+# Only off resets it. The harness writes this file itself, and the default here
+# fills a gap rather than clobbering a real run.
+OUT="$( cd "$WORK"
+  rm -f tool-harness.md
+  printf '{"mode":"native_loop","executed_request_count":3}\n' > tool-harness.json
+  TOOL_MODE="native_loop"
+  default_tool_harness
+  printf 'json=[%s]' "$(tr -d ' \n' < tool-harness.json)" )"
+check_contains "real harness JSON is preserved" "$OUT" '"executed_request_count":3'
 
 echo "=== the corpus gates the header on the file, not on TOOL_MODE ==="
 check_contains "corpus.sh gates the Tool Harness header" \

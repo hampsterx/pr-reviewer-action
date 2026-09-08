@@ -53,6 +53,16 @@ EOF
     # left by an earlier run would otherwise present itself as this review's
     # findings, the same reason standards-context.md is truncated above.
     : > tool-harness.md
+    # The JSON needs the same treatment, and it is the half that reaches
+    # further. escalation.py reads planning_error and error out of this file, so
+    # a stale one escalates a review that ran no tools; the step summary reports
+    # its call counts, usage, cache-hit ratio and evidence digest, so a stale one
+    # attributes the previous run's telemetry to this review. Gating it on
+    # existence while truncating the Markdown leaves the reused-workspace
+    # rationale half-applied.
+    cat > tool-harness.json <<'EOF'
+{"mode":"off","planned_request_count":0,"executed_request_count":0,"tool_results":[]}
+EOF
     ;;
 esac
 

@@ -427,6 +427,30 @@ class TestToolHarness:
         result = strip_empty_conditional_sections(text, ABSENT_ALL)
         assert result == text
 
+    @pytest.mark.parametrize(
+        "heading",
+        [
+            "## Tool Harness Findings \u2014 None",
+            "## Tool Harness Findings (disabled)",
+            "## Tool Harness Results: No tools enabled",
+            "## \U0001f6e0 Tool Harness Findings",
+            "## Tool Harness",
+            "## Tool Harness Summary",
+        ],
+    )
+    def test_documented_variants_deliberately_survive(self, heading):
+        """These are known false negatives, recorded rather than fixed.
+
+        Whole-title matching cannot recognise a decorated or suffixed heading,
+        and every way of widening it (a prefix, an emoji strip, an arbitrary
+        trailing parenthetical) re-opens the false-strip class that deletes a
+        real finding. Leaving a few words of filler is the cheaper failure, so
+        these survive on purpose. The list is here so a future widening has to
+        argue with a test rather than with a comment.
+        """
+        text = f"## Summary\n\nok.\n\n{heading}\n\nno results.\n"
+        assert strip_empty_conditional_sections(text, ABSENT_ALL) == text
+
     def test_missing_signal_defaults_to_keeping_the_section(self):
         """Fail-safe: a caller that never reports on the key strips nothing."""
         text = "## Tool Harness Findings\n\n3 calls executed.\n"
