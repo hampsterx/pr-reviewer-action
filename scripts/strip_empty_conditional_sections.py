@@ -23,7 +23,7 @@ describes. It is the one section the prompt used to request unconditionally.
 Usage:
   # stdin → stdout (presence via env, defaults to "present" = keep)
   LINKED_ISSUE_PRESENT=false EVIDENCE_PROVIDER_PRESENT=false \
-    STANDARDS_PRESENT=false \
+    STANDARDS_PRESENT=false TOOL_HARNESS_PRESENT=false \
     cat review.md | python3 strip_empty_conditional_sections.py
   # file in-place
   python3 strip_empty_conditional_sections.py review.md
@@ -34,6 +34,7 @@ Env:
   LINKED_ISSUE_PRESENT        true when linked-issues.md is non-empty
   EVIDENCE_PROVIDER_PRESENT   true when evidence-providers.md is non-empty
   STANDARDS_PRESENT           true when a standards file resolved to a real file
+  TOOL_HARNESS_PRESENT        true when tool-harness.md is non-empty
 """
 
 import argparse
@@ -53,6 +54,40 @@ SECTION_HEADINGS = {
     # standards file resolved there is nothing for any standards heading to say.
     "standards": "standards",
 }
+
+# Matched as a WHOLE heading, not as a prefix, and that difference is the point.
+# A prefix is safe for the three above: nothing but its own section is headed
+# "Standards ...". It is not safe here, because "Tool Harness ..." is a plausible
+# change-by-change finding heading on a PR that touches harness code while the
+# reviewing action itself runs with tools off. Prefix matching deletes
+# "### Tool Harness Results Leak Secrets" along with its whole body, and
+# narrowing the prefix does not fix that, it only changes which findings it
+# eats. Leaving filler behind costs a few words; deleting a finding costs the
+# finding.
+SECTION_TITLES = {
+    "tool_harness_findings": "tool harness findings",
+    "tool_harness_results": "tool harness results",
+}
+
+# The qualifiers the corpus header actually carries. An allowlist, not a general
+# "strip any trailing parenthetical": corpus.sh emits exactly one of these, while
+# a finding headed "### Tool Harness Results (Fork Skip)" would normalise straight
+# onto a title under the general form and be deleted with its body, which is the
+# false strip this whole approach exists to avoid.
+_TITLE_QUALIFIERS = ("(incremental review)",)
+
+# The trailing punctuation and closing hashes an ATX heading may end with.
+_TITLE_TRIM_RE = re.compile(r"[\s:;.,\u2013\u2014#-]+$")
+
+
+def _normalise_title(heading_text: str) -> str:
+    """Reduce a heading to its bare title, for whole-title comparison."""
+    t = _TITLE_TRIM_RE.sub("", heading_text.strip().lower())
+    for qualifier in _TITLE_QUALIFIERS:
+        if t.endswith(qualifier):
+            t = _TITLE_TRIM_RE.sub("", t[: -len(qualifier)])
+            break
+    return " ".join(t.split())
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 # CommonMark fenced code block opening: up to 3 leading spaces, then 3+ backticks
@@ -75,6 +110,10 @@ def _target_key(heading_text: str, present: dict):
     low = heading_text.lower()
     for key, phrase in SECTION_HEADINGS.items():
         if low.startswith(phrase) and _section_absent(key, present):
+            return key
+    title = _normalise_title(heading_text)
+    for key, exact in SECTION_TITLES.items():
+        if title == exact and _section_absent(key, present):
             return key
     return None
 
@@ -180,6 +219,9 @@ def _present_from_env(env) -> dict:
         "linked_issue": flag("LINKED_ISSUE_PRESENT"),
         "evidence_provider": flag("EVIDENCE_PROVIDER_PRESENT"),
         "standards": flag("STANDARDS_PRESENT"),
+        # One corpus signal, two headings the model may pick between.
+        "tool_harness_findings": flag("TOOL_HARNESS_PRESENT"),
+        "tool_harness_results": flag("TOOL_HARNESS_PRESENT"),
     }
 
 
@@ -206,7 +248,11 @@ def main() -> None:
     changed = stripped != content
 
     if args.dry_run:
-        removed = [k for k in SECTION_HEADINGS if _section_absent(k, present)]
+        removed = [
+            k
+            for k in list(SECTION_HEADINGS) + list(SECTION_TITLES)
+            if _section_absent(k, present)
+        ]
         sys.stdout.write(stripped)
         sys.stderr.write(
             f"\n[strip_empty_conditional_sections] present={present} "

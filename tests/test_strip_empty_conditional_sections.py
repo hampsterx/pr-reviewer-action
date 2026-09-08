@@ -28,8 +28,20 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
-PRESENT_ALL = {"linked_issue": True, "evidence_provider": True, "standards": True}
-ABSENT_ALL = {"linked_issue": False, "evidence_provider": False, "standards": False}
+PRESENT_ALL = {
+    "linked_issue": True,
+    "evidence_provider": True,
+    "standards": True,
+    "tool_harness_findings": True,
+    "tool_harness_results": True,
+}
+ABSENT_ALL = {
+    "linked_issue": False,
+    "evidence_provider": False,
+    "standards": False,
+    "tool_harness_findings": False,
+    "tool_harness_results": False,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -335,3 +347,160 @@ class TestEdgeCaseInputs:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Tool Harness Findings
+# ---------------------------------------------------------------------------
+
+
+class TestToolHarness:
+    """The corpus gates the Tool Harness header on [ -s tool-harness.md ], which
+    with tool_mode=off is always empty. These pin the output-side backstop for
+    the same condition."""
+
+    @pytest.mark.parametrize(
+        "heading",
+        [
+            "## Tool Harness Findings",
+            "## Tool Harness Results",
+            "## Tool Harness Findings (incremental review)",
+            "## tool harness findings",
+        ],
+    )
+    def test_absent_harness_section_is_stripped(self, heading):
+        text = (
+            "## Summary\n\nLGTM.\n\n"
+            f"{heading}\n\nThe tool harness was disabled, so no results.\n\n"
+            "## Sources\n\npr.diff\n"
+        )
+        result = strip_empty_conditional_sections(text, ABSENT_ALL)
+        assert "Tool Harness" not in result
+        assert "tool harness" not in result.lower()
+        assert "## Summary" in result
+        assert "## Sources" in result
+
+    @pytest.mark.parametrize(
+        "heading", ["## Tool Harness Findings", "## Tool Harness Results"]
+    )
+    def test_present_harness_section_is_kept(self, heading):
+        text = f"## Summary\n\nLGTM.\n\n{heading}\n\ngh_api (ok): 3 calls.\n"
+        assert strip_empty_conditional_sections(text, PRESENT_ALL) == text
+
+    @pytest.mark.parametrize(
+        "finding_heading",
+        [
+            # Neither retained title is a prefix of these.
+            "### Tool Harness Error Handling",
+            "### Tool Harness Timeouts",
+            # These two DO begin with a retained title, which is exactly why the
+            # match is whole-title rather than a prefix. A narrower prefix would
+            # still have eaten them, it would only have changed which findings
+            # it ate.
+            "### Tool Harness Results Leak Secrets",
+            "### Tool Harness Findings Are Dropped on Reused Workspaces",
+            # A section-shaped noun that is not one of the two real titles.
+            "### Tool Harness Summary Is Truncated",
+            # A parenthetical that is part of the finding, not the corpus's
+            # "(incremental review)" qualifier. Stripping any trailing
+            # parenthetical would normalise these onto a title and delete them.
+            "### Tool Harness Results (Fork Skip)",
+            "### Tool Harness Findings (see below)",
+            "### Tool Harness Results (leak secrets)",
+        ],
+    )
+    def test_a_finding_about_harness_code_survives(self, finding_heading):
+        """The match is whole-title, unlike the other three keys.
+
+        A PR that changes tool-harness code earns findings headed "Tool Harness
+        <something>", and the reviewing action may itself be running with tools
+        off. Matching on a prefix deletes those findings along with their bodies,
+        and the cost is asymmetric: leaving filler behind costs a few words,
+        deleting a finding costs the finding.
+        """
+        text = (
+            "## Change-by-Change Findings\n\n"
+            f"{finding_heading}\n\n"
+            "The changed error path publishes an unredacted header.\n\n"
+            "## Sources\n\npr.diff\n"
+        )
+        result = strip_empty_conditional_sections(text, ABSENT_ALL)
+        assert result == text
+
+    @pytest.mark.parametrize(
+        "heading",
+        [
+            "## Tool Harness Findings \u2014 None",
+            "## Tool Harness Findings (disabled)",
+            "## Tool Harness Results: No tools enabled",
+            "## \U0001f6e0 Tool Harness Findings",
+            "## Tool Harness",
+            "## Tool Harness Summary",
+        ],
+    )
+    def test_documented_variants_deliberately_survive(self, heading):
+        """These are known false negatives, recorded rather than fixed.
+
+        Whole-title matching cannot recognise a decorated or suffixed heading,
+        and every way of widening it (a prefix, an emoji strip, an arbitrary
+        trailing parenthetical) re-opens the false-strip class that deletes a
+        real finding. Leaving a few words of filler is the cheaper failure, so
+        these survive on purpose. The list is here so a future widening has to
+        argue with a test rather than with a comment.
+        """
+        text = f"## Summary\n\nok.\n\n{heading}\n\nno results.\n"
+        assert strip_empty_conditional_sections(text, ABSENT_ALL) == text
+
+    def test_missing_signal_defaults_to_keeping_the_section(self):
+        """Fail-safe: a caller that never reports on the key strips nothing."""
+        text = "## Tool Harness Findings\n\n3 calls executed.\n"
+        assert strip_empty_conditional_sections(text, {}) == text
+
+    def test_only_the_corpus_qualifier_is_stripped(self):
+        """The corpus emits one qualifier on this header and no other.
+
+        A general "strip any trailing parenthetical" would delete a finding
+        headed "### Tool Harness Results (Fork Skip)", so the qualifier is an
+        allowlist. This pins both directions at once.
+        """
+        real = "## Tool Harness Findings (incremental review)\n\nfiller.\n"
+        assert strip_empty_conditional_sections(real, ABSENT_ALL).strip() == ""
+
+    @pytest.mark.parametrize(
+        "heading", ["## Tool Harness Findings", "## Tool Harness Results"]
+    )
+    def test_tool_harness_present_env_is_honored_via_cli(self, tmp_path, heading):
+        """TOOL_HARNESS_PRESENT is read on the in-place CLI path.
+
+        publish_helpers.sh passes the signal by env, so without this the
+        _present_from_env wiring can be deleted with every other assertion in
+        this file still green: the section would then be stripped from every
+        review whose harness actually ran.
+        """
+        import subprocess
+        import sys
+
+        body = f"## Summary\n\nok.\n\n{heading}\n\ngh_api (ok): 3 calls.\n"
+        script = str(_SCRIPTS_DIR / "strip_empty_conditional_sections.py")
+
+        kept = tmp_path / "kept.md"
+        kept.write_text(body)
+        r = subprocess.run(
+            [sys.executable, script, str(kept)],
+            capture_output=True, text=True,
+            env={"PATH": "/usr/bin:/bin", "TOOL_HARNESS_PRESENT": "true"},
+        )
+        assert r.returncode == 0
+        assert kept.read_text() == body
+
+        stripped = tmp_path / "stripped.md"
+        stripped.write_text(body)
+        r = subprocess.run(
+            [sys.executable, script, str(stripped)],
+            capture_output=True, text=True,
+            env={"PATH": "/usr/bin:/bin", "TOOL_HARNESS_PRESENT": "false"},
+        )
+        assert r.returncode == 0
+        assert heading not in stripped.read_text()
+        assert "gh_api (ok): 3 calls." not in stripped.read_text()
+        assert "## Summary" in stripped.read_text()

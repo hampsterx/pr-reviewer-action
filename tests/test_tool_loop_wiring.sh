@@ -27,7 +27,12 @@ HARNESS="$(cat "$ROOT_DIR/scripts/run_tool_harness.py")"
 echo "=== run_review.sh accepts only off|native_loop ==="
 check_contains "mode validation accepts native_loop only" "$SRC" "off|native_loop)"
 check_contains "stale plan_execute_* degrades to off" "$SRC" "plan_execute_once|plan_execute_loop)"
-check_contains "harness pending stub covers native_loop" "$SRC" "    native_loop)"
+# Pins the stub's text rather than its indentation: the block stopped being
+# nested when the off branch gained an unconditional truncate, and this string
+# appears only in the native_loop arm. The arm's behaviour (including the
+# missing-or-empty re-initialisation) is pinned by
+# tests/test_tool_harness_presence_signal.sh.
+check_contains "harness pending stub covers native_loop" "$SRC" "Tool harness planning pending."
 check_contains "native_loop runs the harness" "$SRC" 'native_loop) TOOL_HARNESS_ENABLED="true"'
 
 echo ""
