@@ -557,9 +557,7 @@ Tool harness planning pending.
 EOF
       ;;
     *)
-      cat > "$output_file" <<'EOF'
-Tool harness disabled.
-EOF
+      : > "$output_file"
       ;;
   esac
 }
@@ -569,9 +567,18 @@ create_default_tool_harness "native_loop" "$TMPDIR/th-planning.md"
 check "planning mode has neutral text" "$(cat "$TMPDIR/th-planning.md")" "Tool harness planning pending."
 check "planning mode does not say disabled" "$(grep -c 'disabled' "$TMPDIR/th-planning.md" || true)" "0"
 
-# Test: off mode should still contain "disabled"
+# Test: off mode leaves the file empty, so the corpus header is gated off. A
+# status line here would be a populated section for the model to report on,
+# which is what #400 fixed for linked-issues.md.
 create_default_tool_harness "off" "$TMPDIR/th-disabled.md"
-check "off mode has disabled text" "$(cat "$TMPDIR/th-disabled.md")" "Tool harness disabled."
+check "off mode writes an empty harness file" "$(wc -c < "$TMPDIR/th-disabled.md" | tr -d ' ')" "0"
+
+# The corpus header is gated on the file, not on TOOL_MODE, so the two stubs
+# that do carry text (fork-skip, harness failure) still emit their section.
+printf 'Tool harness was skipped for a cross-repository pull request.\n' > "$TMPDIR/th-fork.md"
+emit_harness_section() { [ -s "$1" ] && { echo "# Tool Harness Findings"; cat "$1"; }; }
+check "empty harness file emits no section" "$(emit_harness_section "$TMPDIR/th-disabled.md")" ""
+check "fork-skip stub still emits its section" "$(emit_harness_section "$TMPDIR/th-fork.md" | head -1)" "# Tool Harness Findings"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

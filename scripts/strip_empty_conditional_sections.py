@@ -23,7 +23,7 @@ describes. It is the one section the prompt used to request unconditionally.
 Usage:
   # stdin → stdout (presence via env, defaults to "present" = keep)
   LINKED_ISSUE_PRESENT=false EVIDENCE_PROVIDER_PRESENT=false \
-    STANDARDS_PRESENT=false \
+    STANDARDS_PRESENT=false TOOL_HARNESS_PRESENT=false \
     cat review.md | python3 strip_empty_conditional_sections.py
   # file in-place
   python3 strip_empty_conditional_sections.py review.md
@@ -34,6 +34,7 @@ Env:
   LINKED_ISSUE_PRESENT        true when linked-issues.md is non-empty
   EVIDENCE_PROVIDER_PRESENT   true when evidence-providers.md is non-empty
   STANDARDS_PRESENT           true when a standards file resolved to a real file
+  TOOL_HARNESS_PRESENT        true when tool-harness.md is non-empty
 """
 
 import argparse
@@ -52,6 +53,15 @@ SECTION_HEADINGS = {
     # "## Standards Notes" all match. Over-matching is harmless here: with no
     # standards file resolved there is nothing for any standards heading to say.
     "standards": "standards",
+    # Unlike the three above, this one is NOT safe to over-match. "Standards"
+    # heads nothing but its own section, whereas "Tool Harness ..." is a
+    # plausible change-by-change heading on a PR that touches harness code
+    # while the reviewing action itself runs with tools off — and stripping
+    # that would delete a real finding. So both section titles are matched in
+    # full ("(incremental review)" and similar suffixes still ride along on the
+    # startswith), and nothing else beginning "tool harness" is touched.
+    "tool_harness_findings": "tool harness findings",
+    "tool_harness_results": "tool harness results",
 }
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -180,6 +190,9 @@ def _present_from_env(env) -> dict:
         "linked_issue": flag("LINKED_ISSUE_PRESENT"),
         "evidence_provider": flag("EVIDENCE_PROVIDER_PRESENT"),
         "standards": flag("STANDARDS_PRESENT"),
+        # One corpus signal, two headings the model may pick between.
+        "tool_harness_findings": flag("TOOL_HARNESS_PRESENT"),
+        "tool_harness_results": flag("TOOL_HARNESS_PRESENT"),
     }
 
 

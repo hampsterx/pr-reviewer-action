@@ -30,20 +30,31 @@ else
   fi
 fi
 
-if [ ! -f tool-harness.md ]; then
-  case "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" in
-    native_loop)
+case "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" in
+  native_loop)
+    # The planner is about to be asked to plan tool calls, so it needs to see
+    # that the harness is pending rather than an absent section (#101/#108).
+    # Missing OR empty: a reused workspace can carry an empty file from an
+    # earlier off-mode run, and -f alone would leave the planner without the
+    # pending marker and the verdict turn without a section to substitute into.
+    if [ ! -s tool-harness.md ]; then
       cat > tool-harness.md <<'EOF'
 Tool harness planning pending.
 EOF
-      ;;
-    *)
-      cat > tool-harness.md <<'EOF'
-Tool harness disabled.
-EOF
-      ;;
-  esac
-fi
+    fi
+    ;;
+  *)
+    # Off means no harness runs, so there is no output to report this review
+    # and the header below is gated on this file being non-empty. Writing a
+    # status line here instead would hand the model a populated section to
+    # report on, which is the failure #400 fixed for linked-issues.md.
+    #
+    # Truncate rather than test for existence: on a reused workspace a file
+    # left by an earlier run would otherwise present itself as this review's
+    # findings, the same reason standards-context.md is truncated above.
+    : > tool-harness.md
+    ;;
+esac
 
 if [ ! -f tool-harness.json ]; then
   cat > tool-harness.json <<'EOF'
@@ -149,13 +160,15 @@ print(render_evidence_memory_section(load_evidence_memory()), end='')
     # High-value evidence comes BEFORE linked sources / repo scans so that when
     # the corpus overflows the budget, the noisy low-value sections at the tail
     # are dropped first instead of this evidence.
-    if [[ "$corpus_type" == "incremental" ]]; then
-      echo "# Tool Harness Findings (incremental review)"
-    else
-      echo "# Tool Harness Findings"
+    if [ -s tool-harness.md ]; then
+      if [[ "$corpus_type" == "incremental" ]]; then
+        echo "# Tool Harness Findings (incremental review)"
+      else
+        echo "# Tool Harness Findings"
+      fi
+      cat tool-harness.md
+      echo
     fi
-    cat tool-harness.md
-    echo
     # run_evidence_providers.py leaves evidence-providers.md empty when no
     # providers are configured, same treatment as linked-issues.md above.
     if [ -s evidence-providers.md ]; then

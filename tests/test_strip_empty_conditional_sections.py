@@ -28,8 +28,20 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
-PRESENT_ALL = {"linked_issue": True, "evidence_provider": True, "standards": True}
-ABSENT_ALL = {"linked_issue": False, "evidence_provider": False, "standards": False}
+PRESENT_ALL = {
+    "linked_issue": True,
+    "evidence_provider": True,
+    "standards": True,
+    "tool_harness_findings": True,
+    "tool_harness_results": True,
+}
+ABSENT_ALL = {
+    "linked_issue": False,
+    "evidence_provider": False,
+    "standards": False,
+    "tool_harness_findings": False,
+    "tool_harness_results": False,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -335,3 +347,104 @@ class TestEdgeCaseInputs:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Tool Harness Findings
+# ---------------------------------------------------------------------------
+
+
+class TestToolHarness:
+    """The corpus gates the Tool Harness header on [ -s tool-harness.md ], which
+    with tool_mode=off is always empty. These pin the output-side backstop for
+    the same condition."""
+
+    @pytest.mark.parametrize(
+        "heading",
+        [
+            "## Tool Harness Findings",
+            "## Tool Harness Results",
+            "## Tool Harness Findings (incremental review)",
+            "## tool harness findings",
+        ],
+    )
+    def test_absent_harness_section_is_stripped(self, heading):
+        text = (
+            "## Summary\n\nLGTM.\n\n"
+            f"{heading}\n\nThe tool harness was disabled, so no results.\n\n"
+            "## Sources\n\npr.diff\n"
+        )
+        result = strip_empty_conditional_sections(text, ABSENT_ALL)
+        assert "Tool Harness" not in result
+        assert "tool harness" not in result.lower()
+        assert "## Summary" in result
+        assert "## Sources" in result
+
+    @pytest.mark.parametrize(
+        "heading", ["## Tool Harness Findings", "## Tool Harness Results"]
+    )
+    def test_present_harness_section_is_kept(self, heading):
+        text = f"## Summary\n\nLGTM.\n\n{heading}\n\ngh_api (ok): 3 calls.\n"
+        assert strip_empty_conditional_sections(text, PRESENT_ALL) == text
+
+    def test_a_finding_about_harness_code_survives(self):
+        """The match is deliberately narrower than the other three keys.
+
+        A PR that changes tool-harness code earns findings headed "Tool Harness
+        <something>", and the reviewing action may itself be running with tools
+        off. A bare "tool harness" prefix would delete those findings along with
+        the filler section, so only the two real section titles match.
+        """
+        text = (
+            "## Change-by-Change Findings\n\n"
+            "### Tool Harness Error Handling\n\n"
+            "run_tool_harness.py swallows an exception here; surface it.\n\n"
+            "### Tool Harness Timeouts\n\n"
+            "The turn timeout also bounds the verdict call.\n\n"
+            "## Sources\n\npr.diff\n"
+        )
+        result = strip_empty_conditional_sections(text, ABSENT_ALL)
+        assert result == text
+
+    def test_missing_signal_defaults_to_keeping_the_section(self):
+        """Fail-safe: a caller that never reports on the key strips nothing."""
+        text = "## Tool Harness Findings\n\n3 calls executed.\n"
+        assert strip_empty_conditional_sections(text, {}) == text
+
+    def test_tool_harness_present_env_is_honored_via_cli(self, tmp_path):
+        """TOOL_HARNESS_PRESENT is read on the in-place CLI path.
+
+        publish_helpers.sh passes the signal by env, so without this the
+        _present_from_env wiring can be deleted with every other assertion in
+        this file still green: the section would then be stripped from every
+        review whose harness actually ran.
+        """
+        import subprocess
+        import sys
+
+        body = (
+            "## Summary\n\nok.\n\n"
+            "## Tool Harness Findings\n\ngh_api (ok): 3 calls.\n"
+        )
+        script = str(_SCRIPTS_DIR / "strip_empty_conditional_sections.py")
+
+        kept = tmp_path / "kept.md"
+        kept.write_text(body)
+        r = subprocess.run(
+            [sys.executable, script, str(kept)],
+            capture_output=True, text=True,
+            env={"PATH": "/usr/bin:/bin", "TOOL_HARNESS_PRESENT": "true"},
+        )
+        assert r.returncode == 0
+        assert kept.read_text() == body
+
+        stripped = tmp_path / "stripped.md"
+        stripped.write_text(body)
+        r = subprocess.run(
+            [sys.executable, script, str(stripped)],
+            capture_output=True, text=True,
+            env={"PATH": "/usr/bin:/bin", "TOOL_HARNESS_PRESENT": "false"},
+        )
+        assert r.returncode == 0
+        assert "Tool Harness Findings" not in stripped.read_text()
+        assert "## Summary" in stripped.read_text()

@@ -18,19 +18,23 @@ sanitize_review_markdown() {
 
   # Deterministic backstop for #415: even with a clean, header-free corpus the
   # model confabulates "## Linked Issue Fit" / "## Evidence Provider Findings" /
-  # "## Standards Compliance" sections padded with "nothing was found" filler.
+  # "## Standards Compliance" / "## Tool Harness Findings" sections padded with
+  # "nothing was found" filler.
   # Presence mirrors the exact [ -s file ] gates scripts/sections/corpus.sh uses
   # to emit (or omit) those section headers, so this only ever strips sections
   # the corpus never offered. corpus.sh writes standards-present.txt on both
   # paths (resolved path, or truncated), so its absence means the corpus was
   # never built — in which case there is no review markdown to strip either.
   local linked_present=false evidence_present=false standards_present=false
+  local tool_harness_present=false
   if [ -s linked-issues.md ]; then linked_present=true; fi
   if [ -s evidence-providers.md ]; then evidence_present=true; fi
   if [ -s standards-present.txt ]; then standards_present=true; fi
+  if [ -s tool-harness.md ]; then tool_harness_present=true; fi
   LINKED_ISSUE_PRESENT="$linked_present" \
   EVIDENCE_PROVIDER_PRESENT="$evidence_present" \
   STANDARDS_PRESENT="$standards_present" \
+  TOOL_HARNESS_PRESENT="$tool_harness_present" \
     python3 "${GITHUB_ACTION_PATH}/scripts/strip_empty_conditional_sections.py" "$output_file"
 }
 
