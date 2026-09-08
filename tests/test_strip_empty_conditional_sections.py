@@ -406,6 +406,7 @@ class TestToolHarness:
             # parenthetical would normalise these onto a title and delete them.
             "### Tool Harness Results (Fork Skip)",
             "### Tool Harness Findings (see below)",
+            "### Tool Harness Results (leak secrets)",
         ],
     )
     def test_a_finding_about_harness_code_survives(self, finding_heading):
@@ -477,4 +478,5 @@ class TestToolHarness:
         )
         assert r.returncode == 0
         assert heading not in stripped.read_text()
+        assert "gh_api (ok): 3 calls." not in stripped.read_text()
         assert "## Summary" in stripped.read_text()
