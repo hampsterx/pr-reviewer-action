@@ -387,20 +387,35 @@ class TestToolHarness:
         text = f"## Summary\n\nLGTM.\n\n{heading}\n\ngh_api (ok): 3 calls.\n"
         assert strip_empty_conditional_sections(text, PRESENT_ALL) == text
 
-    def test_a_finding_about_harness_code_survives(self):
-        """The match is deliberately narrower than the other three keys.
+    @pytest.mark.parametrize(
+        "finding_heading",
+        [
+            # Neither retained title is a prefix of these.
+            "### Tool Harness Error Handling",
+            "### Tool Harness Timeouts",
+            # These two DO begin with a retained title, which is exactly why the
+            # match is whole-title rather than a prefix. A narrower prefix would
+            # still have eaten them, it would only have changed which findings
+            # it ate.
+            "### Tool Harness Results Leak Secrets",
+            "### Tool Harness Findings Are Dropped on Reused Workspaces",
+            # A section-shaped noun that is not one of the two real titles.
+            "### Tool Harness Summary Is Truncated",
+        ],
+    )
+    def test_a_finding_about_harness_code_survives(self, finding_heading):
+        """The match is whole-title, unlike the other three keys.
 
         A PR that changes tool-harness code earns findings headed "Tool Harness
         <something>", and the reviewing action may itself be running with tools
-        off. A bare "tool harness" prefix would delete those findings along with
-        the filler section, so only the two real section titles match.
+        off. Matching on a prefix deletes those findings along with their bodies,
+        and the cost is asymmetric: leaving filler behind costs a few words,
+        deleting a finding costs the finding.
         """
         text = (
             "## Change-by-Change Findings\n\n"
-            "### Tool Harness Error Handling\n\n"
-            "run_tool_harness.py swallows an exception here; surface it.\n\n"
-            "### Tool Harness Timeouts\n\n"
-            "The turn timeout also bounds the verdict call.\n\n"
+            f"{finding_heading}\n\n"
+            "The changed error path publishes an unredacted header.\n\n"
             "## Sources\n\npr.diff\n"
         )
         result = strip_empty_conditional_sections(text, ABSENT_ALL)
@@ -411,7 +426,10 @@ class TestToolHarness:
         text = "## Tool Harness Findings\n\n3 calls executed.\n"
         assert strip_empty_conditional_sections(text, {}) == text
 
-    def test_tool_harness_present_env_is_honored_via_cli(self, tmp_path):
+    @pytest.mark.parametrize(
+        "heading", ["## Tool Harness Findings", "## Tool Harness Results"]
+    )
+    def test_tool_harness_present_env_is_honored_via_cli(self, tmp_path, heading):
         """TOOL_HARNESS_PRESENT is read on the in-place CLI path.
 
         publish_helpers.sh passes the signal by env, so without this the
@@ -422,10 +440,7 @@ class TestToolHarness:
         import subprocess
         import sys
 
-        body = (
-            "## Summary\n\nok.\n\n"
-            "## Tool Harness Findings\n\ngh_api (ok): 3 calls.\n"
-        )
+        body = f"## Summary\n\nok.\n\n{heading}\n\ngh_api (ok): 3 calls.\n"
         script = str(_SCRIPTS_DIR / "strip_empty_conditional_sections.py")
 
         kept = tmp_path / "kept.md"
@@ -446,5 +461,5 @@ class TestToolHarness:
             env={"PATH": "/usr/bin:/bin", "TOOL_HARNESS_PRESENT": "false"},
         )
         assert r.returncode == 0
-        assert "Tool Harness Findings" not in stripped.read_text()
+        assert heading not in stripped.read_text()
         assert "## Summary" in stripped.read_text()

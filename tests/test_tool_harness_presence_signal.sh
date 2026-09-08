@@ -7,7 +7,7 @@ set -euo pipefail
 # stripper on the same file.
 #
 # The distinction that matters is between "no harness output" (tool_mode=off,
-# empty file, no section) and "the harness had something to say" — the
+# empty file, no section) and "the harness had something to say": the
 # native_loop planning placeholder, the fork skip, and the failure stub all
 # carry text and must keep their section. Gating on the file rather than on
 # TOOL_MODE is what keeps those three working.

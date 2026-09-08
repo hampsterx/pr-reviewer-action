@@ -53,16 +53,34 @@ SECTION_HEADINGS = {
     # "## Standards Notes" all match. Over-matching is harmless here: with no
     # standards file resolved there is nothing for any standards heading to say.
     "standards": "standards",
-    # Unlike the three above, this one is NOT safe to over-match. "Standards"
-    # heads nothing but its own section, whereas "Tool Harness ..." is a
-    # plausible change-by-change heading on a PR that touches harness code
-    # while the reviewing action itself runs with tools off — and stripping
-    # that would delete a real finding. So both section titles are matched in
-    # full ("(incremental review)" and similar suffixes still ride along on the
-    # startswith), and nothing else beginning "tool harness" is touched.
+}
+
+# Matched as a WHOLE heading, not as a prefix, and that difference is the point.
+# A prefix is safe for the three above: nothing but its own section is headed
+# "Standards ...". It is not safe here, because "Tool Harness ..." is a plausible
+# change-by-change finding heading on a PR that touches harness code while the
+# reviewing action itself runs with tools off. Prefix matching deletes
+# "### Tool Harness Results Leak Secrets" along with its whole body, and
+# narrowing the prefix does not fix that, it only changes which findings it
+# eats. Leaving filler behind costs a few words; deleting a finding costs the
+# finding.
+SECTION_TITLES = {
     "tool_harness_findings": "tool harness findings",
     "tool_harness_results": "tool harness results",
 }
+
+# The qualifier the corpus header carries ("(incremental review)"), plus the
+# trailing punctuation and closing hashes an ATX heading may end with.
+_TITLE_QUALIFIER_RE = re.compile(r"\s*\([^)]*\)\s*$")
+_TITLE_TRIM_RE = re.compile(r"[\s:;.,\u2013\u2014#-]+$")
+
+
+def _normalise_title(heading_text: str) -> str:
+    """Reduce a heading to its bare title, for whole-title comparison."""
+    t = _TITLE_TRIM_RE.sub("", heading_text.strip().lower())
+    t = _TITLE_QUALIFIER_RE.sub("", t)
+    t = _TITLE_TRIM_RE.sub("", t)
+    return " ".join(t.split())
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 # CommonMark fenced code block opening: up to 3 leading spaces, then 3+ backticks
@@ -85,6 +103,10 @@ def _target_key(heading_text: str, present: dict):
     low = heading_text.lower()
     for key, phrase in SECTION_HEADINGS.items():
         if low.startswith(phrase) and _section_absent(key, present):
+            return key
+    title = _normalise_title(heading_text)
+    for key, exact in SECTION_TITLES.items():
+        if title == exact and _section_absent(key, present):
             return key
     return None
 
@@ -219,7 +241,11 @@ def main() -> None:
     changed = stripped != content
 
     if args.dry_run:
-        removed = [k for k in SECTION_HEADINGS if _section_absent(k, present)]
+        removed = [
+            k
+            for k in list(SECTION_HEADINGS) + list(SECTION_TITLES)
+            if _section_absent(k, present)
+        ]
         sys.stdout.write(stripped)
         sys.stderr.write(
             f"\n[strip_empty_conditional_sections] present={present} "
