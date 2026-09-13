@@ -295,27 +295,42 @@ def test_category_caps(tmp_path):
 
 def test_important_files_cap(tmp_path):
     """Regression: an important-files bucket alone exceeding the cap must
-    surface in truncation metadata, not be silently dropped (#569)."""
-    # 60 manifests, no other categories, one top-level dir (no root truncation).
-    files = {f"pkg{i:02d}/pyproject.toml": "x\n" for i in range(60)}
-    files.update({"a/top.py": "x\n"})
+    surface in truncation metadata, not be silently dropped (#569).
+
+    The PR review asked for a test where ONLY an important-files bucket
+    exceeds the cap — no roots / categories / entries / depth truncation
+    confounding. ``requirements-NN.txt`` is the only manifest filename
+    pattern that admits many distinct paths, so 60 of them in a single
+    directory drive the bucket past ``max_files_per_category`` without
+    adding extra top-level dirs (just ``pkg/``), extra categories (no
+    test/migration/api/auth match for ``requirements*.txt``), extra tree
+    depth (depth 2 fits the default 3), or extra entries (61 candidates
+    fits the default 500).
+    """
+    files = {f"pkg/requirements-{i:02d}.txt": "x\n" for i in range(60)}
     root = make_repo(tmp_path, files)
     repo = generate_repo_map(root, max_files_per_category=50)
 
     assert len(repo["important_files"]["manifests"]) == 50
+    # ONLY the important-files cap fires — every other omitted_* count is
+    # zero, and the reasons list is exactly that one entry. If the
+    # important-files accounting ever regresses to silent, this assertion
+    # catches it before the truncation flag flips.
     assert repo["truncation"]["omitted_important_files"] == 10
-    # Only the important-files cap is the focused reason here; the 60
-    # manifest dirs also push the root count past the cap, so the
-    # important-files reason is present (not silent) without being alone.
-    assert "important_files_cap" in repo["truncation"]["reasons"]
-    assert repo["truncation"]["omitted_important_files"] == 10
+    assert repo["truncation"]["reasons"] == ["important_files_cap"]
     assert repo["truncation"]["omitted_category_files"] == 0
+    assert repo["truncation"]["omitted_roots"] == 0
+    assert repo["truncation"]["omitted_entries"] == 0
     assert repo["truncation"]["truncated"] is True
 
     # And the omission is surfaced in the Markdown view, not just JSON.
     md = render_repo_map_markdown(repo)
     assert "important_files_cap" in md
     assert "10 important files omitted" in md
+    # No spurious omissions from the other buckets leak into the note.
+    assert "category files omitted" not in md
+    assert "roots omitted" not in md
+    assert "tree entries omitted" not in md
 
     # An empty bucket reports zero omissions (no false-positive reason).
     clean_dir = tmp_path / "clean"
