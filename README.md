@@ -624,7 +624,7 @@ In `native_loop` mode the reviewing model uses its provider's native tool-callin
 - `find_files` to locate files by filename/path glob pattern (e.g. `*config*`, `*.toml`, `*/route.ts`) without first knowing an exact path — returns sorted repo-relative file paths only, capped at `max_results` (default 100, max 300); never descends into `.git` or follows symlinks
 - `list_tree` to list repository entries (names only, no contents) bounded by depth and entry count — returns sorted repo-relative `{path, type}` rows (type is `file` or `dir`), capped at `max_entries` (default 200, max 500); `depth` defaults to 2 and is clamped to 1..4; a file passed as `path` returns a one-row listing; never descends into `.git` or follows symlinks
 - `web_fetch` for allowlisted hosts from `allowed_source_hosts`
-- `git_grep` for local repository content search
+- `git_grep` for local repository content search (`pattern` is required; an optional `path` scopes the search to a repository subtree and an optional `max_results` (1–200, default 60) caps how many matched lines are returned)
 - `run_command` for a fixed catalog of named read-only commands
 
 `run_command` never executes model-supplied shell text. The planner may only pick a command **name** from the built-in catalog, and the action runs the corresponding fixed argv (no shell involved):
