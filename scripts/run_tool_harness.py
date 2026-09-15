@@ -297,11 +297,43 @@ def build_planning_context(max_bytes, corpus_path=None):
     regions = {}
     if corpus_text:
         lines = corpus_text.split("\n")
-        starts = [i for i, ln in enumerate(lines) if ln.startswith("# ")]
+        corpus_titles = {
+            "Changed Manifest Context",
+            "PR Metadata",
+            "PR Classification",
+            "Related Code Context",
+            "Repository Map",
+            "Incremental Review Delta",
+            "Linked Issue Context",
+            "PR Files (truncated)",
+            "Version Hints from Diff",
+            "PR Diff (truncated)",
+            "Tool Harness Findings",
+            "Evidence Providers",
+            "CI Check Results",
+            "Image Digest Provenance",
+            "Linked Sources",
+            "Repository Impact Scan",
+            "Repository History",
+        }
+        starts = []
+        in_related_context = False
+        for index, line in enumerate(lines):
+            if not line.startswith("# "):
+                continue
+            title = line[2:].strip()
+            if title == "Related Code Context":
+                in_related_context = True
+            elif in_related_context and title.startswith("Related Code ("):
+                continue
+            else:
+                in_related_context = False
+            if title in corpus_titles:
+                starts.append(index)
         bounds = starts + [len(lines)]
         for i in range(len(starts)):
             title = lines[starts[i]][2:].strip()
-            if title in ("PR Classification", "Repository Map", "PR Files (truncated)", "Version Hints from Diff"):
+            if title in ("PR Classification", "Related Code Context", "Repository Map", "PR Files (truncated)", "Version Hints from Diff"):
                 regions.setdefault(title, "\n".join(lines[starts[i]:bounds[i + 1]]).rstrip())
         if lines[0].startswith("# Repository Standards and Conventions"):
             end = corpus_text.find("\n# Changed Manifest Context")
@@ -369,6 +401,7 @@ def build_planning_context(max_bytes, corpus_path=None):
 
     plan = [
         ("PR Classification", "PR Classification", "classification.json", 4000, "json"),
+        ("Related Code Context", "Related Code Context", "related-code.truncated.md", 16000, None),
         ("PR Files (truncated)", "Changed Files", "pr-files.truncated.json", 6000, "json"),
         ("Version Hints from Diff", "Version Hints from Diff", "version-hints.truncated.txt", 2500, "text"),
         ("standards", "Repository Standards and Conventions", "standards-context.capped.md", 6000, None),
@@ -401,12 +434,18 @@ def build_planning_context(max_bytes, corpus_path=None):
         if map_section is None:
             map_section = _repo_map_excerpt("repo-map.md", map_cap)
         if map_section is not None:
+            related_index = next(
+                (index for index, section in enumerate(sections)
+                 if section.startswith("# Related Code Context")),
+                -1,
+            )
             classification_index = next(
                 (index for index, section in enumerate(sections)
                  if section.startswith("# PR Classification")),
                 -1,
             )
-            sections.insert(classification_index + 1 if classification_index >= 0 else 0, map_section)
+            insert_at = related_index + 1 if related_index >= 0 else classification_index + 1
+            sections.insert(insert_at if insert_at >= 0 else 0, map_section)
 
     if sections:
         # Whatever budget remains goes to the head of the diff. The diff head
