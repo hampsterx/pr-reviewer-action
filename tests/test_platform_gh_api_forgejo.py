@@ -27,10 +27,12 @@ which is the part the model-injection threat model cares about.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,7 +43,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from pr_reviewer import platform  # noqa: E402
-from pr_reviewer.platform import gh_api  # noqa: E402
+from pr_reviewer.platform import gh_api, repo_contents  # noqa: E402
 
 
 _REPO = "owner/repo"
@@ -473,6 +475,258 @@ def test_tool_harness_shim_dispatches_to_platform(monkeypatch):
 # 5. Auto-resolution: PLATFORM=auto with a non-github GITHUB_SERVER_URL
 #    routes to the Forgejo backend.
 # ---------------------------------------------------------------------------
+
+
+def test_repo_contents_current_repo_is_allowed_and_omits_ref(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    response = type("Response", (), {
+        "read": lambda self: json.dumps([{"path": "z.txt", "type": "file"}, {"path": "a", "type": "dir"}]).encode(),
+        "__enter__": lambda self: self,
+        "__exit__": lambda self, *args: False,
+    })()
+    with patch("pr_reviewer.platform.urllib.request.urlopen", return_value=response) as mock_urlopen:
+        result = repo_contents(_REPO, "", None, set(), _REPO, max_entries=1)
+    assert result == {"repo": _REPO, "path": "", "type": "directory", "entries": [{"path": "a", "type": "directory"}], "truncated": True}
+    request = mock_urlopen.call_args.args[0]
+    assert "?ref=" not in request.full_url
+
+
+@pytest.mark.parametrize("field", ["repo", "path", "ref"])
+@pytest.mark.parametrize("value", ["bad\x00value", "bad\nvalue", "bad#value", "bad\\value", "````"])
+def test_repo_contents_rejects_adversarial_arguments(monkeypatch, field, value):
+    monkeypatch.setenv("PLATFORM", "github")
+    args = {"repo": _REPO, "path": "src/file.py", "ref": "main"}
+    args[field] = value
+    with patch("pr_reviewer.platform.urllib.request.urlopen") as mock_urlopen:
+        result = repo_contents(
+            args["repo"], args["path"], args["ref"], {"*"}, _REPO
+        )
+    assert result.get("error"), result
+    mock_urlopen.assert_not_called()
+
+
+def test_repo_contents_allowlist_and_hostile_arguments_are_rejected(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "github")
+    with patch("pr_reviewer.platform.urllib.request.urlopen") as mock_urlopen:
+        assert "not allowed" in repo_contents("other/repo", "x", None, set(), _REPO)["error"]
+        assert "Invalid repo" in repo_contents("other/repo?x", "x", None, {"*"}, _REPO)["error"]
+        assert "Invalid path" in repo_contents(_REPO, "../secret", None, set(), _REPO)["error"]
+        assert "Invalid ref" in repo_contents(_REPO, "x", "main?x", set(), _REPO)["error"]
+        assert "not allowed" in repo_contents("listed/repo", "x", None, {"other/repo"}, _REPO)["error"]
+    mock_urlopen.assert_not_called()
+
+
+def _json_response(payload):
+    return type("Response", (), {
+        "read": lambda self: json.dumps(payload).encode(),
+        "__enter__": lambda self: self,
+        "__exit__": lambda self, *args: False,
+    })()
+
+
+def test_repo_contents_explicit_allowlist_and_wildcard_are_authorized(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    sha = "a" * 40
+    responses = [
+        _json_response([{"name": "README.md", "type": "file", "sha": sha}]),
+        _json_response({"encoding": "base64", "content": "aGk="}),
+        _json_response([{"name": "README.md", "type": "file", "sha": sha}]),
+        _json_response({"encoding": "base64", "content": "aGk="}),
+    ]
+    with patch("pr_reviewer.platform.urllib.request.urlopen", side_effect=responses) as mock_urlopen:
+        listed = repo_contents("listed/repo", "README.md", None, {"listed/repo"}, _REPO)
+        wildcard = repo_contents("wild/repo", "README.md", None, {"*"}, _REPO)
+    assert listed["content"] == wildcard["content"] == "hi"
+    assert mock_urlopen.call_count == 4
+
+
+def test_repo_contents_regular_file_preflight_uses_same_ref(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    sha = "a" * 40
+    responses = [
+        _json_response([{"name": "config.yaml", "type": "file", "sha": sha}]),
+        _json_response({"encoding": "base64", "content": "aGk="}),
+    ]
+    with patch("pr_reviewer.platform.urllib.request.urlopen", side_effect=responses) as mock_urlopen:
+        result = repo_contents(_REPO, "docs/config.yaml", "release", set(), _REPO)
+    assert result["content"] == "hi"
+    assert [call.args[0].full_url for call in mock_urlopen.call_args_list] == [
+        "https://api.github.com/repos/owner/repo/contents/docs?ref=release",
+        f"https://api.github.com/repos/owner/repo/git/blobs/{'a' * 40}",
+    ]
+
+
+@pytest.mark.parametrize("target", [".env", "docs/real-config"])
+def test_repo_contents_file_preflight_rejects_symlink_targets(monkeypatch, target):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    with patch(
+        "pr_reviewer.platform.urllib.request.urlopen",
+        side_effect=[
+            _json_response([{"name": "config-link", "type": "symlink", "target": target}]),
+        ],
+    ) as mock_urlopen:
+        result = repo_contents(_REPO, "docs/config-link", "main", set(), _REPO)
+    assert result == {"error": "Repository contents file preflight failed"}
+    assert mock_urlopen.call_count == 1
+    assert "config-link" not in mock_urlopen.call_args.args[0].full_url
+
+
+@pytest.mark.parametrize("entry_type", ["submodule", "unexpected"])
+def test_repo_contents_file_preflight_rejects_non_regular_entries(monkeypatch, entry_type):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    with patch(
+        "pr_reviewer.platform.urllib.request.urlopen",
+        return_value=_json_response([{"name": "config-link", "type": entry_type}]),
+    ) as mock_urlopen:
+        result = repo_contents(_REPO, "docs/config-link", "main", set(), _REPO)
+    assert result == {"error": "Repository contents file preflight failed"}
+    mock_urlopen.assert_called_once()
+
+
+def test_repo_contents_nested_directory_listing_remains_supported(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    with patch(
+        "pr_reviewer.platform.urllib.request.urlopen",
+        side_effect=[
+            _json_response([{"name": "config", "type": "dir"}]),
+            _json_response([{"path": "docs/config/a.yml", "type": "file"}]),
+        ],
+    ) as mock_urlopen:
+        result = repo_contents(_REPO, "docs/config", "main", set(), _REPO)
+    assert result == {
+        "repo": _REPO,
+        "path": "docs/config",
+        "type": "directory",
+        "entries": [{"path": "docs/config/a.yml", "type": "file"}],
+        "truncated": False,
+    }
+    assert mock_urlopen.call_count == 2
+
+
+def test_repo_contents_file_preflight_rejects_missing_entry(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    with patch(
+        "pr_reviewer.platform.urllib.request.urlopen",
+        return_value=_json_response([{"name": "other.txt", "type": "file"}]),
+    ) as mock_urlopen:
+        result = repo_contents(_REPO, "docs/config-link", "main", set(), _REPO)
+    assert result == {"error": "Repository contents file preflight failed"}
+    mock_urlopen.assert_called_once()
+
+
+@pytest.mark.parametrize("sha", ["", "not-a-sha", "A" * 40, "a" * 39, "a" * 41])
+def test_repo_contents_file_preflight_rejects_invalid_blob_sha(monkeypatch, sha):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    with patch(
+        "pr_reviewer.platform.urllib.request.urlopen",
+        return_value=_json_response([{"name": "config-link", "type": "file", "sha": sha}]),
+    ) as mock_urlopen:
+        result = repo_contents(_REPO, "docs/config-link", "main", set(), _REPO)
+    assert result == {"error": "Repository contents file preflight failed"}
+    mock_urlopen.assert_called_once()
+
+
+def test_repo_contents_file_uses_preflight_blob_when_path_ref_moves(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    sha = "b" * 40
+    parent_url = "https://api.github.com/repos/owner/repo/contents/docs?ref=main"
+    blob_url = f"https://api.github.com/repos/owner/repo/git/blobs/{sha}"
+    direct_url = "https://api.github.com/repos/owner/repo/contents/docs/config-link?ref=main"
+    benign_content = base64.b64encode(b"BENIGN CONFIG").decode()
+    secret_content = base64.b64encode(b"TOP-SECRET").decode()
+    responses = {
+        parent_url: _json_response([{"name": "config-link", "type": "file", "sha": sha}]),
+        blob_url: _json_response({"encoding": "base64", "content": benign_content}),
+        direct_url: _json_response({"type": "file", "encoding": "base64", "content": secret_content}),
+    }
+
+    def urlopen(request, *args, **kwargs):
+        return responses[request.full_url]
+
+    with patch("pr_reviewer.platform.urllib.request.urlopen", side_effect=urlopen) as mock_urlopen:
+        result = repo_contents(_REPO, "docs/config-link", "main", set(), _REPO)
+
+    requested_urls = [call.args[0].full_url for call in mock_urlopen.call_args_list]
+    assert result["content"] == "BENIGN CONFIG"
+    assert "TOP-SECRET" not in str(result)
+    assert secret_content not in str(result)
+    assert direct_url not in requested_urls
+    blob_requests = [url for url in requested_urls if "/git/blobs/" in url]
+    assert blob_requests == [blob_url]
+    assert all("?ref=" not in url for url in blob_requests)
+
+
+def test_repo_contents_github_404_returns_error(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    sha = "c" * 40
+    error = urllib.error.HTTPError(
+        f"https://api.github.com/repos/owner/repo/git/blobs/{sha}",
+        404,
+        "Not Found",
+        {},
+        None,
+    )
+    with patch(
+        "pr_reviewer.platform.urllib.request.urlopen",
+        side_effect=[_json_response([{"name": "missing", "type": "file", "sha": sha}]), error],
+    ):
+        result = repo_contents(_REPO, "missing", None, set(), _REPO)
+    assert result == {"error": "GitHub contents API error: 404 Not Found"}
+
+
+def test_repo_contents_github_timeout_returns_error(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    sha = "d" * 40
+    with patch(
+        "pr_reviewer.platform.urllib.request.urlopen",
+        side_effect=[_json_response([{"name": "README.md", "type": "file", "sha": sha}]), TimeoutError("request timed out")],
+    ):
+        result = repo_contents(_REPO, "README.md", None, set(), _REPO)
+    assert result == {"error": "GitHub contents API timed out after 25s"}
+
+
+def test_repo_contents_file_is_text_capped_and_binary_is_metadata(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    payloads = [
+        {"type": "file", "encoding": "base64", "content": base64.b64encode(b"x" * 13000).decode()},
+        {"type": "file", "encoding": "base64", "content": base64.b64encode(b"x\x00y").decode()},
+    ]
+    responses = []
+    for name, payload, sha in zip(("README.md", "image.dat"), payloads, ("e" * 40, "f" * 40)):
+        responses.extend([
+            _json_response([{"name": name, "type": "file", "sha": sha}]),
+            _json_response({key: value for key, value in payload.items() if key != "type"}),
+        ])
+    with patch("pr_reviewer.platform.urllib.request.urlopen", side_effect=responses):
+        text_result = repo_contents(_REPO, "README.md", "main", set(), _REPO)
+        binary_result = repo_contents(_REPO, "image.dat", "main", set(), _REPO)
+    assert len(text_result["content"].encode()) <= 12000 and text_result["truncated"]
+    assert "content" not in binary_result and binary_result["binary"] is True
+
+
+def test_repo_contents_forgejo_is_explicitly_unsupported_without_github_fallback(monkeypatch):
+    monkeypatch.setenv("PLATFORM", "forgejo")
+    monkeypatch.setenv("FORGEJO_API_URL", _FORGEJO_BASE)
+    monkeypatch.setenv("FORGEJO_TOKEN", "fj-test")
+    with patch("pr_reviewer.forgejo_backend.subprocess.run") as mock_run, patch(
+        "pr_reviewer.platform.urllib.request.urlopen"
+    ) as mock_urlopen:
+        result = repo_contents("owner/repo", "README.md", None, {_REPO}, _REPO)
+    assert "not supported" in result.get("error", "").lower()
+    mock_run.assert_not_called()
+    mock_urlopen.assert_not_called()
 
 
 def test_auto_platform_with_forgejo_server_url_uses_forgejo_backend(monkeypatch):
