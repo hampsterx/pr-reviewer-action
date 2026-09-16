@@ -4,12 +4,14 @@
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 # Ensure the scripts directory and project root are on sys.path so we can
 # import shared helpers (redact) and pr_reviewer modules.
@@ -21,6 +23,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from pr_reviewer.env import env_int  # noqa: E402
+from pr_reviewer.sarif import (
+    MAX_FINDINGS as SARIF_DEFAULT_MAX_FINDINGS,
+    MAX_INPUT_BYTES as SARIF_MAX_INPUT_BYTES,
+    normalize_sarif,
+)  # noqa: E402
 from redact import mask_and_truncate, mask_secrets  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -30,7 +37,7 @@ def normalize_severity(value: object) -> str:
     if value is None:
         return "info"
     text = str(value).strip().lower()
-    if text in {"info", "warning", "blocker"}:
+    if text in {"info", "minor", "warning", "major", "blocker"}:
         return text
     return "info"
 
@@ -38,7 +45,7 @@ def normalize_severity(value: object) -> str:
 def severity_rank(value: str) -> int:
     if value == "blocker":
         return 3
-    if value == "warning":
+    if value in {"major", "warning"}:
         return 2
     return 1
 
@@ -265,6 +272,128 @@ def head_tail_cap(text: str, max_bytes: int) -> str:
     return head + "\n…[middle truncated]…\n" + tail
 
 
+def _split_sarif_paths(raw: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[,\n]", raw) if part.strip()]
+
+
+def _workspace_path(path_text: str, workspace_root: Path) -> Path | None:
+    if not path_text or "\x00" in path_text:
+        return None
+    candidate = Path(path_text)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    try:
+        resolved = (workspace_root / candidate).resolve()
+        if not resolved.is_relative_to(workspace_root.resolve()):
+            return None
+        return resolved
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _sarif_provider(
+    index: int,
+    path_text: str,
+    workspace_root: Path,
+    max_findings: int,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "id": f"sarif-{index}",
+        "kind": "sarif",
+        "status": "error",
+        "command": "",
+        "duration_sec": 0.0,
+        "exit_code": None,
+        "provider_severity": "info",
+        "findings": [],
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "source": mask_secrets(path_text),
+        "output_format": "sarif-2.1.0",
+    }
+    path = _workspace_path(path_text, workspace_root)
+    if path is None:
+        entry["provider_severity"] = "major"
+        entry["stderr"] = "SARIF path must be a workspace-relative path that stays inside the workspace"
+        return entry
+    if not path.is_file():
+        entry["provider_severity"] = "major"
+        entry["stderr"] = mask_secrets(f"SARIF file not found or not a regular file: {path_text}")
+        return entry
+
+    # Bounded read (#574 contract): never load more than the byte limit into
+    # memory — read limit+1 bytes and reject when the extra byte shows up, so
+    # a multi-gigabyte file cannot be slurped before the size check.
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(SARIF_MAX_INPUT_BYTES + 1)
+        if len(raw) > SARIF_MAX_INPUT_BYTES:
+            raise ValueError(f"SARIF input exceeds {SARIF_MAX_INPUT_BYTES} byte limit")
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        entry["provider_severity"] = "major"
+        entry["stderr"] = mask_secrets(f"Unable to parse SARIF file {path_text}: {exc}")
+        return entry
+
+    normalized = normalize_sarif(payload, max_findings=max_findings)
+    entry["findings"] = [
+        {
+            "severity": item["severity"],
+            "message": mask_secrets(_sarif_finding_message(item)),
+            "source": mask_secrets(_sarif_finding_source(item, path_text)),
+            "tool_name": mask_secrets(item["tool_name"]),
+            "tool_version": mask_secrets(item["tool_version"]),
+            "rule_id": mask_secrets(item["rule_id"]),
+            "title": mask_secrets(item["title"]),
+            "file": mask_secrets(item["file"]),
+            "line": item["line"],
+            "help_uri": mask_secrets(item["help_uri"]),
+        }
+        for item in normalized["findings"]
+    ]
+    if normalized["errors"]:
+        entry["stderr"] = mask_secrets("; ".join(normalized["errors"]))
+    if normalized.get("truncated"):
+        # Covers both a per-file finding cap and an exhausted collective cap
+        # (max_findings=0), so an empty-looking entry is distinguishable
+        # from a genuinely clean SARIF file.
+        note = (
+            f"SARIF findings capped: {len(entry['findings'])} included, "
+            f"{normalized['truncation']['omitted_findings']} omitted"
+        )
+        entry["stderr"] = f"{entry['stderr']}; {note}" if entry["stderr"] else note
+    entry["status"] = "error" if normalized["errors"] else "ok"
+    entry["provider_severity"] = max(
+        (finding["severity"] for finding in entry["findings"]),
+        key=severity_rank,
+        default=entry["provider_severity"],
+    )
+    return entry
+
+
+def _sarif_finding_message(finding: dict[str, Any]) -> str:
+    location = ""
+    if finding.get("file"):
+        location = f" ({finding['file']}"
+        if finding.get("line") is not None:
+            location += f":{finding['line']}"
+        location += ")"
+    rule_id = finding.get("rule_id") or ""
+    rule = f" [{rule_id}]" if rule_id else ""
+    # normalize_sarif falls back title to the ruleId when a rule carries no
+    # metadata; prefixing that alongside the "[ruleId]" suffix would duplicate it.
+    title = finding.get("title") or ""
+    title_prefix = f"{title}: " if title and title != rule_id else ""
+    return f"{title_prefix}{finding['message']}{rule}{location}"
+
+
+def _sarif_finding_source(finding: dict[str, Any], path_text: str) -> str:
+    tool = finding.get("tool_name") or "SARIF"
+    return f"{path_text} ({tool})"
+
+
 def write_outputs(summary: dict, markdown: str) -> None:
     Path("evidence-providers.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
@@ -282,54 +411,68 @@ def write_outputs(summary: dict, markdown: str) -> None:
 
 def main() -> int:
     config_path_raw = os.getenv("EVIDENCE_PROVIDERS_FILE", "").strip()
+    sarif_paths = _split_sarif_paths(os.getenv("SARIF_FILES", ""))
     default_timeout = env_int("EVIDENCE_PROVIDER_TIMEOUT_SEC", 30)
     default_max_output = env_int("EVIDENCE_PROVIDER_MAX_OUTPUT_BYTES", 20000)
+    raw_sarif_max_findings = os.getenv("SARIF_MAX_FINDINGS")
+    try:
+        sarif_max_findings = (
+            int(raw_sarif_max_findings)
+            if raw_sarif_max_findings is not None
+            else SARIF_DEFAULT_MAX_FINDINGS
+        )
+        if sarif_max_findings < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        sarif_max_findings = SARIF_DEFAULT_MAX_FINDINGS
+    workspace_root = Path(os.getenv("GITHUB_WORKSPACE") or os.getcwd()).resolve()
 
     summary = {
-        "configured": False,
+        "configured": bool(config_path_raw or sarif_paths),
         "config_path": config_path_raw,
+        "sarif_files": sarif_paths,
         "has_blocker": False,
         "providers": [],
     }
 
-    if not config_path_raw:
+    if not config_path_raw and not sarif_paths:
         # Leave the markdown empty (not "not configured") — this is the normal,
         # expected state for consumers with no evidence providers set up, not
         # a diagnostic worth a corpus section. See #399/#409.
         write_outputs(summary, "")
         return 0
 
-    config_path = Path(config_path_raw)
-    if not config_path.exists():
-        summary["error"] = f"Config file not found: {config_path_raw}"
-        write_outputs(
-            summary, f"Evidence providers config was not found: `{config_path_raw}`"
-        )
-        return 0
+    providers: list[object] = []
+    config_error = ""
+    if config_path_raw:
+        config_path = Path(config_path_raw)
+        if not config_path.exists():
+            config_error = f"Config file not found: {config_path_raw}"
+        else:
+            try:
+                payload = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                config_error = f"Invalid JSON config: {exc}"
+            else:
+                if isinstance(payload, dict):
+                    providers = payload.get("providers", [])
+                elif isinstance(payload, list):
+                    providers = payload
+                if not isinstance(providers, list):
+                    providers = []
 
-    try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        summary["error"] = f"Invalid JSON config: {exc}"
-        write_outputs(
-            summary, f"Evidence providers config could not be parsed: `{exc}`"
-        )
-        return 0
-
-    if isinstance(payload, dict):
-        providers = payload.get("providers", [])
-    elif isinstance(payload, list):
-        providers = payload
-    else:
-        providers = []
-
-    if not isinstance(providers, list):
-        providers = []
-
+    if config_error:
+        summary["error"] = config_error
     summary["configured"] = True
     summary["provider_count"] = len(providers)
 
     md_lines = ["Evidence providers executed before final review synthesis.", ""]
+    if config_error:
+        if config_error.startswith("Config file not found:"):
+            md_lines.append(f"Evidence providers config was not found: `{config_path_raw}`")
+        else:
+            md_lines.append(f"Evidence providers config could not be parsed: `{config_error.removeprefix('Invalid JSON config: ')}`")
+        md_lines.append("")
 
     # Providers are independent commands, so run them concurrently. Results
     # keep config order regardless of completion order. Set
@@ -353,6 +496,15 @@ def main() -> int:
             summary["has_blocker"] = True
         summary["providers"].append(entry)
 
+    remaining_sarif_findings = sarif_max_findings
+    for index, path_text in enumerate(sarif_paths, start=1):
+        entry = _sarif_provider(
+            index, path_text, workspace_root, remaining_sarif_findings
+        )
+        summary["providers"].append(entry)
+        remaining_sarif_findings -= len(entry["findings"])
+    summary["provider_count"] = len(summary["providers"])
+
     # Markdown embeds are head+tail capped, per stream and in aggregate, so
     # one chatty provider cannot crowd everything else out of the corpus.
     # evidence-providers.json keeps the full (per-provider capped) output.
@@ -375,7 +527,7 @@ def main() -> int:
         md_lines.append(block)
         md_lines.append("```")
 
-    if not summary["providers"]:
+    if not summary["providers"] and not config_error:
         md_lines.append("No providers were configured in the config file.")
     else:
         for provider in summary["providers"]:
@@ -383,7 +535,10 @@ def main() -> int:
             md_lines.append(
                 f"- status: {provider['status']}; severity: {provider['provider_severity']}; exit_code: {provider['exit_code']}; duration_sec: {provider['duration_sec']}"
             )
-            md_lines.append(f"- command: `{provider['command']}`")
+            if provider.get("kind") == "sarif":
+                md_lines.append(f"- SARIF source: `{provider['source']}`")
+            else:
+                md_lines.append(f"- command: `{provider['command']}`")
 
             findings = provider.get("findings", [])
             if findings:
@@ -407,7 +562,6 @@ def main() -> int:
     # Join md_lines into the markdown string, then redact it.
     markdown = "\n".join(md_lines)
     markdown = mask_secrets(markdown)
-
     write_outputs(summary, markdown)
     return 0
 
