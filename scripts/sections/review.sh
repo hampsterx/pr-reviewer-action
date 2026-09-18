@@ -83,6 +83,47 @@ The corpus lists Open Findings From the Previous Review. Answer EVERY one: inclu
   log "Carry-forward active: $(jq 'length' previous-findings.json) open finding(s) from the previous review"
 fi
 
+# ── Deep review (#608): opt-in specialist leads, run concurrently ──────────
+# When DEEP_REVIEW=true, launch the three fixed specialist roles
+# (correctness / security / tests — pr_reviewer/specialists.py) as a
+# BACKGROUND JOB over the same truncated review corpus, reusing the primary
+# model settings. The three roles run concurrently WITH EACH OTHER (the
+# runner fans them out on internal threads); the phase as a whole is launched
+# here and fully reaped (wait on SPECIALISTS_PID) BEFORE the final reviewer
+# path below enters, so a follow-up (#609) can feed specialists.json into the
+# final synthesis. Fail-soft: a specialist that times out or fails is
+# recorded as an error in specialists.json and the final reviewer still runs
+# — never blocked, never aborted (the wait is guarded with || status=$?
+# against set -e). Advisory only: the leads never touch the verdict,
+# enforcement, or the published review body in this iteration. When
+# DEEP_REVIEW is false the gate is not entered and the normal path is
+# preserved untouched (no timer entries, no artifacts).
+DEEP_REVIEW_ACTIVE="false"
+SPECIALISTS_PID=""
+if [[ "$(printf '%s' "$DEEP_REVIEW" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
+  DEEP_REVIEW_ACTIVE="true"
+  section_timer_start "specialists"
+  python3 "$SCRIPT_DIR/run_specialists.py" --corpus review-corpus.truncated.md >specialists.phase.log 2>&1 &
+  SPECIALISTS_PID=$!
+  log "deep_review: specialist roles (correctness/security/tests) launched concurrently over the review corpus (pid $SPECIALISTS_PID)"
+fi
+
+# Reap the specialist phase fully BEFORE the final reviewer path (the #371
+# harvest idiom): a nonzero phase status only logs an error — advisory passes
+# never block the final review.
+harvest_specialist_phase() {
+  [[ "${DEEP_REVIEW_ACTIVE:-false}" == "true" ]] || return 0
+  [[ -n "${SPECIALISTS_PID:-}" ]] || return 0
+  local status=0
+  wait "$SPECIALISTS_PID" || status=$?
+  cat specialists.phase.log 2>/dev/null || true
+  if [ "$status" -ne 0 ]; then
+    error "specialist phase exited ${status}; continuing (advisory passes never block the final review)"
+  fi
+  section_timer_end
+}
+harvest_specialist_phase
+
 PRIMARY_OK=0
 # native_loop in-conversation verdict (#205): when the tool loop produced its
 # own verdict (final turn, full reasoning history preserved), it wrote the
@@ -443,6 +484,16 @@ write_step_summary() {
     echo "| Tool calls | ${tool_call_count} executed (${tool_success_count} successful) |"
     echo "| Route | ${REVIEW_ROUTE:-legacy} (${ROUTE_REASON:-}) |"
     echo "| Scope | ${EFFECTIVE_SCOPE} |"
+    if [[ "${DEEP_REVIEW_ACTIVE:-false}" == "true" ]]; then
+      local deep_review_leads deep_review_errors
+      deep_review_leads="$(jq -r '.total_leads // 0' specialists.json 2>/dev/null || echo '?')"
+      deep_review_errors="$(jq -r '.any_errors // false' specialists.json 2>/dev/null || echo '?')"
+      if [[ "$deep_review_errors" == "true" ]]; then
+        echo "| Deep review | ${deep_review_leads} specialist lead(s); some roles recorded errors (advisory only) |"
+      else
+        echo "| Deep review | ${deep_review_leads} specialist lead(s) (advisory only) |"
+      fi
+    fi
     if [[ "${NEEDS_FULL_REVIEW:-false}" == "true" ]]; then
       echo "| Incremental insufficient | ${UNVERIFIABLE_COUNT:-0} carried finding(s) not evaluable from delta — next run full |"
     fi
@@ -456,4 +507,5 @@ write_step_summary() {
     echo "| Completion tokens | ${comp_tok} |"
   } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 }
+
 write_step_summary
