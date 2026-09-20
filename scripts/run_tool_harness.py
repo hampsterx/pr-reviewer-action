@@ -57,6 +57,10 @@ from pr_reviewer.repo_map import (  # noqa: E402
     render_repo_map_markdown,
     trust_framing_overhead,
 )
+from pr_reviewer.specialists import (  # noqa: E402
+    SPECIALIST_ROLES_ORDER,
+    render_specialist_leads_section,
+)
 
 # Conditional-fragment placeholders in default_system_prompt.txt, e.g.
 # {{VERSION_BUMP_GUIDANCE}} (substituted by apply_system_prompt_fragments).
@@ -316,6 +320,7 @@ def build_planning_context(max_bytes, corpus_path=None):
             "Linked Sources",
             "Repository Impact Scan",
             "Repository History",
+            "Specialist Review Leads",
         }
         starts = []
         in_related_context = False
@@ -334,7 +339,7 @@ def build_planning_context(max_bytes, corpus_path=None):
         bounds = starts + [len(lines)]
         for i in range(len(starts)):
             title = lines[starts[i]][2:].strip()
-            if title in ("PR Classification", "Related Code Context", "Repository Map", "PR Files (truncated)", "Version Hints from Diff"):
+            if title in ("PR Classification", "Related Code Context", "Repository Map", "PR Files (truncated)", "Version Hints from Diff", "Specialist Review Leads"):
                 regions.setdefault(title, "\n".join(lines[starts[i]:bounds[i + 1]]).rstrip())
         if lines[0].startswith("# Repository Standards and Conventions"):
             end = corpus_text.find("\n# Changed Manifest Context")
@@ -399,6 +404,98 @@ def build_planning_context(max_bytes, corpus_path=None):
         any_clipped = True
         return final
 
+
+    # ── Specialist Review Leads: reserved FIRST for first-turn visibility ──
+    # The advisory leads must already be in the context when the native loop
+    # takes its FIRST tool-planning turn (the #609 placement guarantee). As the
+    # LAST plan entry they were starv-able: the greedy discovery sections — above
+    # all Related Code Context (per-section cap 16000) — could consume the whole
+    # max_bytes - _PLANNING_RESERVE budget first, leaving avail < 400 so the
+    # leads were skipped entirely. At the repo's dogfooded tool_corpus_max_bytes
+    # (15000) a large related-code section did exactly that. Commit the leads
+    # BEFORE the plan loop so their bytes occupy _used() — and therefore the head
+    # of the joined text, which is the part that survives mask_and_truncate's
+    # tail clip — while every lower-priority section below still shares what
+    # remains via the existing _used() accounting. Bounded to the same 6000 slice
+    # and only attempted when there is room beyond the diff reserve. When the
+    # section is larger than that slice it must NOT be generic byte-sliced (that
+    # would split a lead mid-line or cut inside a role's fence); see
+    # _specialist_leads_excerpt for the structure-aware reduction.
+    def _specialist_leads_excerpt(cap):
+        """Whole-lead, fence-safe, sanitized Specialist Review Leads slice.
+
+        Called ONLY after the current-run stale-workspace gate below, so the
+        per-role artifacts read here are known to be THIS run's.
+        render_specialist_leads_section is the single authority for this
+        section's integrity: whole-lead drops only, balanced fences, secret and
+        control-character sanitization, and "" when nothing usable fits. So a
+        section over the planning slice is re-rendered from the normalized
+        per-role artifacts (``specialist-<role>.json``) at ``cap`` — never byte-
+        sliced (a slice of the rendered Markdown could split a lead mid-line,
+        break a role's code fence, drop the closing fence, or emit a generic
+        ``[truncated]``). If no usable artifact is available (abnormal for a
+        gated run, since run_specialists.py writes the artifacts and the section
+        together), embed ``specialists.md`` whole ONLY if it already fits
+        ``cap``; never emit a partial. Returning ``None`` means the section is
+        omitted, never truncated into a malformed prompt.
+        """
+        nonlocal any_clipped
+        role_results = {}
+        have_artifact = False
+        for role in SPECIALIST_ROLES_ORDER:
+            artifact = None
+            body = _read_stripped(f"specialist-{role}.json")
+            if body is not None:
+                try:
+                    parsed = json.loads(body)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    artifact = parsed
+                    have_artifact = True
+            role_results[role] = artifact
+        if have_artifact:
+            # Re-rendered at a cap smaller than the artifact's own cap, so
+            # whole leads are dropped to fit (a real truncation → flag it).
+            rendered = render_specialist_leads_section(role_results, max_bytes=cap)
+            if rendered:
+                any_clipped = True
+            return rendered or None
+        body = _read_stripped("specialists.md")
+        if body is not None:
+            if len(body.encode("utf-8")) <= cap:
+                return body
+            any_clipped = True  # wanted it but it does not fit whole → omit
+        return None
+
+    sp_room = max_bytes - _PLANNING_RESERVE
+    sp_region = regions.get("Specialist Review Leads")
+    # Stale-workspace gate (#609): the per-role ``specialist-<role>.json``
+    # artifacts are deliberately NOT reset between runs (context.sh resets only
+    # specialists.md + the presence signal), so their mere existence proves
+    # NOTHING about THIS run — a reused workspace whose PREVIOUS run had
+    # deep_review on, re-run with it off, leaves the old role JSON behind with
+    # no current specialist phase. Only two facts are current-run: a non-empty
+    # presence signal (written this run by run_specialists.py) or a Specialist
+    # Review Leads region in the corpus that build_review_corpus freshly
+    # assembled this run (which emits the section only from a current, non-empty
+    # specialists.md). Gate the whole pre-pass — including the role-JSON
+    # structure-aware re-render below — on those, never on role-JSON existence.
+    # Both are false on a deep_review-disabled reused workspace, so no stale lead
+    # can reach the first planning turn; both are true on an enabled run (the
+    # signal and region are written in lockstep with the artifacts).
+    sp_current_run = (
+        _read_stripped("specialist-leads-present.txt") is not None or sp_region is not None
+    )
+    if sp_current_run and sp_room >= 400:
+        sp_cap = min(6000, sp_room)
+        sp_section = None
+        if sp_region is not None and len(sp_region.encode("utf-8")) + 2 <= sp_cap:
+            sp_section = sp_region
+        if sp_section is None:
+            sp_section = _specialist_leads_excerpt(sp_cap)
+        if sp_section is not None:
+            sections.append(sp_section)
 
     plan = [
         ("PR Classification", "PR Classification", "classification.json", 4000, "json"),
