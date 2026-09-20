@@ -223,7 +223,8 @@ none rather than guessing.
 ## Eval harness runbook
 
 The evaluation harness (`scripts/eval_harness.py`) and its graded corpora
-(`evals/corpus-agentic.json` and `evals/corpus-repo-context.json`) are wired
+(`evals/corpus-agentic.json`, `evals/corpus-repo-context.json`, and
+`evals/corpus-specialists.json`) are wired
 into CI by the `eval-harness` workflow (`.github/workflows/eval-harness.yaml`). Use this runbook for manual
 runs or when triaging a failing scheduled regression sweep.
 
@@ -260,9 +261,12 @@ The `eval-harness` workflow has two triggers:
 
 - **`workflow_dispatch`** — runs on demand from the Actions tab. Inputs:
   `corpus` (default `evals/corpus-agentic.json`; choose
-  `evals/corpus-repo-context.json` for the repository-context fixtures), `modes`
-  (default `tools_off native_loop`), `runs-per-mode` (default `10`), `max-prs`
-  (blank = corpus default).
+  `evals/corpus-repo-context.json` for the repository-context fixtures,
+  `evals/corpus-specialists.json` for the deep-review specialist fixtures),
+  `modes` (default `tools_off native_loop`), `runs-per-mode` (default `10`),
+  `max-prs` (blank = corpus default), `deep` (choice `false` / `true` /
+  `both`, default `false` — the deep-review specialist A/B; absent inputs,
+  i.e. the scheduled run, default to standard-only).
 - **`schedule`** — weekly Monday 06:00 UTC sweep against `main`. The
   scheduled run additionally posts a Markdown summary to
   `GITHUB_STEP_SUMMARY` and as a comment on issue #472 so regressions are
@@ -279,3 +283,75 @@ failed vs. the previous baseline. A pass rate below `0.95` or any
 non-empty `regressions` list should block the release; inspect the
 artifact, reproduce locally with the command above, then fix the prompt or
 routing regression in the action before re-running.
+
+### Specialist corpus & deep A/B
+
+`evals/corpus-specialists.json` grades the deep-review specialist phase
+(#610): each fixture carries `specialist_expectations` that the harness
+checks against the normalized specialist telemetry on the run
+(`run.specialists`, loaded from the run's `specialists.json` aggregate and
+`specialist-<role>.json` per-role artifacts). Run it with the same
+harness:
+
+```bash
+python scripts/eval_harness.py \
+    --corpus evals/corpus-specialists.json \
+    --modes native_loop \
+    --deep-review both \
+    --runs-per-mode 10 \
+    --model "$AI_MODEL" \
+    --base-url "$AI_BASE_URL" \
+    --api-key "$AI_API_KEY" \
+    --github-token "$GITHUB_TOKEN" \
+    --output eval-report/eval-report-specialists.json
+```
+
+`--deep-review false|true|both` controls the A/B; deep runs are labelled
+`<mode>+deep` in the report (e.g. `native_loop+deep`) and get their own
+mode summary. Each fixture's `specialist_expectations` splits into two
+grading scopes so the A/B stays honest:
+
+- `lead_checks` — deep-only diagnostics, graded **only** on
+  `<mode>+deep` runs (a standard run cannot produce leads, so scoring one
+  against them would inflate the deep side by definition):
+  - `lead_generated` — at least `min` (default 1) leads for `role` (a
+    single role or a list) matching the lead predicates `category_any`,
+    `file_any`, and `message_any_contains` (loose, case-insensitive
+    substrings).
+  - `lead_disposition` — the disposition the final reviewer must have
+    given a matching lead: `verified`, `rejected`, `unused`,
+    `not_adopted`, or `any`. **`verified` requires concrete evidence**:
+    the check must carry a non-empty `finding_file_any`, and the adopted
+    final finding's `file` must match it — a finding that merely repeats
+    the specialist's wording with no file grounding computes `rejected`,
+    never `verified`. Finding-side needles override via
+    `finding_category_any` / `finding_description_any_contains`, and
+    `finding_line: true` additionally requires a line.
+- `effectiveness_checks` — the comparable A/B subset, graded on **every**
+  run (standard and deep alike) against the run's final findings (the
+  production `message`/`file`/`line` shape consumed from `ai-output.json`):
+  `final_findings_count` (`min`/`max` on the finding predicate) and
+  `dedupe_final_findings` (default `max` 1: overlapping leads must
+  collapse into a single final finding). Every fixture must declare at
+  least one effectiveness check, so standard-vs-deep always compares the
+  same final-review capability.
+
+The report tallies the scopes separately per mode in `mode_summary`:
+`specialist_effectiveness_runs` / `_passes` / `_pass_rate` (populated on
+both the standard and the `+deep` label — this is the comparable
+headline) and `specialist_lead_runs` / `_passes` / `_pass_rate` (deep
+labels only; the standard label's lead rate is `None`). Per-PR entries
+carry the per-label rate dicts and the per-run `specialist_capability`
+detail (each check tagged `scope`), alongside each run's `specialists`
+telemetry. The harness drives the real boundary: it passes `REPO` and
+`PR_NUMBER` to `run_review.sh`, resets stale per-run artifacts
+(`ai-output.json`, `ai-response.*.json`, `specialists.json`, …) per run,
+and loads the final review from `ai-output.json` (verdict, markdown,
+production-shape findings, `verdict_source`), with model/tokens from
+`analysis_engine.txt` and the per-tier `ai-response.*.json` usage. One
+fixture is flagged `negative_control`: it asserts a clean run invents no
+findings (`final_findings_count` / `dedupe_final_findings` max 0) while a
+`max_tool_calls` bound in its `expected_evidence` keeps the tool loop
+lean. The weekly scheduled sweep remains standard-only (`deep`
+absent → `false`), and none of this changes production defaults:
+`deep_review` is still off by default for action users.

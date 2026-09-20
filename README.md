@@ -1139,6 +1139,10 @@ Copyable workflows are included in [`examples/`](examples):
 - [`examples/workflow-self-hosted.yml`](examples/workflow-self-hosted.yml)
 - [`examples/workflow-cloud.yml`](examples/workflow-cloud.yml)
 
+### 📊 Specialist corpus & deep A/B
+
+The `eval-harness` workflow (`.github/workflows/eval-harness.yaml`) runs `scripts/eval_harness.py` against the graded corpora — `evals/corpus-agentic.json`, `evals/corpus-repo-context.json`, and `evals/corpus-specialists.json` — on the weekly scheduled sweep and on demand. The specialist corpus adds a deep-review A/B: the `deep` dispatch input (or `--deep-review false|true|both` locally) runs the specialist phase, and deep runs are labelled `<mode>+deep` in the report. Each fixture's `specialist_expectations` is split into two grading scopes: `lead_checks` (`lead_generated`, `lead_disposition`) are deep-only diagnostics graded only on `<mode>+deep` runs — and a `verified` disposition demands concrete evidence (the adopted finding must be grounded in the expected file via `finding_file_any`, so parroting a specialist's wording proves nothing) — while `effectiveness_checks` (`final_findings_count`, `dedupe_final_findings`) are graded identically on standard and deep runs, keeping the headline comparison an apples-to-apples measure of final-review capability (`specialist_effectiveness_*` rates on both labels; `specialist_lead_*` rates on deep labels only). The harness drives the real review boundary end to end: it passes `REPO`/`PR_NUMBER` to `run_review.sh` and consumes the validated `ai-output.json` artifact (verdict, markdown, production-shape findings) plus specialist telemetry from `specialists.json` and `specialist-<role>.json`. The scheduled sweep stays standard-only, and the production default is unchanged: `deep_review` is still off by default.
+
 ## 📌 Version pinning and releases
 
 The action is versioned via Git tags (e.g., `v2.0.5`). The examples in this README use a floating major tag as a shorthand; in production workflows, pin to a specific version tag or commit SHA for reproducible runs:
