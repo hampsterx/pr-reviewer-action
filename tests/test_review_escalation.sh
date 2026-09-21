@@ -63,9 +63,26 @@ check_contains "input escalate_on_incomplete_required_checks" "$ACTION" "escalat
 check_contains "input escalate_on_fast_request_changes" "$ACTION" "escalate_on_fast_request_changes:"
 check_contains "input escalate_on_fast_low_confidence" "$ACTION" "escalate_on_fast_low_confidence:"
 check_contains "input escalate_on_tool_or_evidence_blockers" "$ACTION" "escalate_on_tool_or_evidence_blockers:"
+# #615 removes the public scope API only. Dirty-baseline escalation remains
+# until #618, using the private prior review_result signal instead of the
+# removed baseline_clean output.
 check_contains "input escalate_on_dirty_baseline" "$ACTION" "escalate_on_dirty_baseline:"
-check_contains "review step receives BASELINE_CLEAN" "$ACTION" "BASELINE_CLEAN: \${{ steps.precheck.outputs.baseline_clean || 'false' }}"
-check_contains "run_review wires dirty_baseline into should_escalate" "$SRC" "dirty_baseline=('\$DIRTY_BASELINE' == 'true')"
+check_contains "review step receives ESCALATE_ON_DIRTY_BASELINE" "$ACTION" \
+  "ESCALATE_ON_DIRTY_BASELINE: \${{ inputs.escalate_on_dirty_baseline }}"
+check_contains "review step receives private previous review result" "$ACTION" \
+  "PREVIOUS_REVIEW_RESULT: \${{ steps.precheck.outputs.previous_review_result || '' }}"
+check_contains "run_review derives dirty_baseline from prior issues verdict" "$SRC" \
+  '[[ "${PREVIOUS_REVIEW_RESULT:-}" == "issues" ]]'
+check_contains "run_review wires dirty_baseline into should_escalate" "$SRC" \
+  "dirty_baseline=('\$DIRTY_BASELINE' == 'true')"
+check "baseline_clean public output remains removed" \
+  "$(printf '%s' "$ACTION" | grep -c 'baseline_clean:' || true)" "0"
+check "review step always emits needs_full_review=false" \
+  "$(grep -c 'NEEDS_FULL_REVIEW="false"' "$RUN_REVIEW")" "1"
+for obsolete_text in 'Incremental Review Insufficient' 'this review is incremental' 'the next run will be a full review'; do
+  check "review step drops obsolete full-rerun text: $obsolete_text" \
+    "$(grep -F -c "$obsolete_text" "$RUN_REVIEW" || true)" "0"
+done
 check_contains "escalation_reason output declared" "$ACTION" "escalation_reason:"
 check "publish step receives ESCALATION_REASON" \
   "$(grep -c 'ESCALATION_REASON: \${{ steps.review.outputs.escalation_reason }}' "$ROOT_DIR/action.yml")" "1"
