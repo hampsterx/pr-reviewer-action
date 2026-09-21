@@ -11,11 +11,32 @@ if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   exit 0
 fi
 
+# Dependency preflight
+for dep in python3; do
+  if ! command -v "$dep" &>/dev/null; then
+    echo "SKIP: $dep is not available — cannot run test_system_prompt_fragments.sh" >&2
+    exit 0
+  fi
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PASS=0; FAIL=0
 # shellcheck source=_lib/assert.sh
 source "$ROOT_DIR/tests/_lib/assert.sh"
+
+# First-occurrence offset of a needle in a string (0-based). Pure bash so it
+# works where grep lacks -b (busybox); the sentinels are ASCII, so a char
+# offset is a byte offset for the ordering comparisons below.
+first_offset() {
+  local s="$1" needle="$2" prefix
+  prefix="${s%%"$needle"*}"
+  if [ "$prefix" = "$s" ]; then
+    printf ''
+  else
+    printf '%s' "$prefix" | wc -c | tr -d ' '
+  fi
+}
 
 # Extract apply_system_prompt_fragments from config.sh (same pattern as the
 # other section-function tests).
@@ -330,8 +351,8 @@ OUT_BOTH="$( run_resolve "PER-PR STEERING" "$TMPF" "replace" )"
 check_contains "both set: keeps the file content" "$OUT_BOTH" "STATIC CONVENTIONS FROM FILE"
 check_contains "both set: keeps the inline content" "$OUT_BOTH" "PER-PR STEERING"
 # Ordering: file content must appear before inline content.
-FILE_POS="$(printf '%s' "$OUT_BOTH" | grep -bo "STATIC CONVENTIONS FROM FILE" | head -1 | cut -d: -f1)"
-INLINE_POS="$(printf '%s' "$OUT_BOTH" | grep -bo "PER-PR STEERING" | head -1 | cut -d: -f1)"
+FILE_POS="$(first_offset "$OUT_BOTH" "STATIC CONVENTIONS FROM FILE")"
+INLINE_POS="$(first_offset "$OUT_BOTH" "PER-PR STEERING")"
 if [[ -n "$FILE_POS" && -n "$INLINE_POS" && "$FILE_POS" -lt "$INLINE_POS" ]]; then
   check_contains "both set: file content precedes inline" "$OUT_BOTH" "STATIC CONVENTIONS FROM FILE"
 else
@@ -378,8 +399,8 @@ OUT="$( cd "$WORK"
 # Both file and inline content are present, file before inline.
 check_contains "append on file+inline: file content present" "$OUT" "FAKE CONVENTIONS SENTINEL"
 check_contains "append on file+inline: inline content present" "$OUT" "COMBINED INLINE SENTINEL"
-FILE_POS="$(printf '%s' "$OUT" | grep -bo "FAKE CONVENTIONS SENTINEL" | head -1 | cut -d: -f1)"
-INLINE_POS="$(printf '%s' "$OUT" | grep -bo "COMBINED INLINE SENTINEL" | head -1 | cut -d: -f1)"
+FILE_POS="$(first_offset "$OUT" "FAKE CONVENTIONS SENTINEL")"
+INLINE_POS="$(first_offset "$OUT" "COMBINED INLINE SENTINEL")"
 if [[ -n "$FILE_POS" && -n "$INLINE_POS" && "$FILE_POS" -lt "$INLINE_POS" ]]; then
   check_contains "append on file+inline: file content precedes inline" "$OUT" "FAKE CONVENTIONS SENTINEL"
 else
@@ -461,6 +482,42 @@ check_contains "Tool Harness Findings trigger is named in the omit directive" \
   "$BASE" "Tool Harness Findings section to the presence of tool harness output"
 check_contains "explicit '- findings: []' filler is forbidden" \
   "$BASE" 'no "- findings: []" filler'
+
+echo "=== the bundled default carries no carried-findings protocol (#617) ==="
+# #617 deleted the carried-findings subsystem: the corpus no longer renders an
+# "Open Findings From the Previous Review" section, response_parser no longer
+# preserves finding id/resolution, and needs_full_review is gone as runtime
+# state. The bundled prompt must not instruct the model to participate in that
+# protocol — neither the section trigger nor the resolution enum, including
+# the legacy delta-verdict spelling and the "delta diff" framing.
+LEGACY_NEEDLES=(
+  "Open Findings From the Previous Review"
+  "still_open"
+  "not_verifiable_from_delta"
+)
+for needle in "${LEGACY_NEEDLES[@]}"; do
+  check_not_contains "bundled default: no legacy carried-findings text ($needle)" \
+    "$BASE" "$needle"
+done
+# No fragment reintroduces the protocol either (substitution could re-add it).
+for frag in "$SCRIPT_DIR"/prompt_fragments/*.txt; do
+  FRAG_CONTENT="$(<"$frag")"
+  for needle in "${LEGACY_NEEDLES[@]}"; do
+    check_not_contains "$(basename "$frag"): no legacy carried-findings text ($needle)" \
+      "$FRAG_CONTENT" "$needle"
+  done
+done
+# And an assembled prompt (concise dial on, so the last placeholder is live)
+# ends clean: substituted fragments cannot revive the deleted protocol.
+OUT_LEGACY="$( cd "$WORK"
+  printf '{"pr_kind":"app_code"}' > classification.json
+  SYSTEM_PROMPT="$BASE" SYSTEM_PROMPT_IS_DEFAULT=1 REVIEW_VERBOSITY=concise
+  apply_system_prompt_fragments
+  printf '%s' "$SYSTEM_PROMPT" )"
+for needle in "${LEGACY_NEEDLES[@]}"; do
+  check_not_contains "assembled prompt: no legacy carried-findings text ($needle)" \
+    "$OUT_LEGACY" "$needle"
+done
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
