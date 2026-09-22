@@ -48,6 +48,21 @@ OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
 # stops it from being discarded so the model can cite real CI outcomes.
 CI_CHECKS_FILE="${CI_CHECKS_FILE:-}"
 
+# Atomic publication bookkeeping (#634): render_ci_checks writes
+# "${CI_CHECKS_FILE}.tmp.$$" then renames it into place. If this process is
+# interrupted (TERM/INT) or fails mid-write, the trap removes the partial
+# sibling so it can never be mistaken for evidence. It never touches
+# CI_CHECKS_FILE itself, so a successfully published target survives.
+CI_CHECKS_TMP=""
+cleanup_ci_checks_tmp() {
+  [[ -n "$CI_CHECKS_TMP" ]] || return 0
+  rm -f -- "$CI_CHECKS_TMP" 2>/dev/null || true
+  CI_CHECKS_TMP=""
+}
+trap 'cleanup_ci_checks_tmp' EXIT
+trap 'cleanup_ci_checks_tmp; exit 130' INT
+trap 'cleanup_ci_checks_tmp; exit 143' TERM
+
 if [[ "$CI_STATUS_CHECK" != "true" ]]; then
   echo "ci_status_skipped=true" >> "$OUTPUT_FILE"
   exit 0
@@ -90,13 +105,31 @@ render_ci_checks() {
   # Nothing external to report — leave no file so run_review omits the section.
   [[ -n "$rows" ]] || return 0
 
-  {
+  # Atomic publish (#634): the CI gate now runs concurrently with the advisory
+  # specialist phase, and a specialist corpus built during that window reads
+  # $CI_CHECKS_FILE. Write to a sibling temp file and rename it into place so a
+  # concurrent reader sees either no evidence or the complete final evidence —
+  # never a half-written document (which would let the specialist corpus claim
+  # a CI result this run had not actually finalized yet).
+  local tmp="${CI_CHECKS_FILE}.tmp.$$"
+  CI_CHECKS_TMP="$tmp"
+  if {
     echo "_CI reached a terminal state before this review began (overall: ${final_state}). These results are from the CI status API for commit ${sha} and are authoritative evidence of which checks ran and how they concluded._"
     echo
     echo "| Check | State |"
     echo "| --- | --- |"
     printf '%s\n' "$rows"
-  } > "$CI_CHECKS_FILE" 2>/dev/null || true
+  } > "$tmp" 2>/dev/null; then
+    if mv -f -- "$tmp" "$CI_CHECKS_FILE" 2>/dev/null; then
+      CI_CHECKS_TMP=""
+    else
+      rm -f -- "$tmp" 2>/dev/null || true
+      CI_CHECKS_TMP=""
+    fi
+  else
+    rm -f -- "$tmp" 2>/dev/null || true
+    CI_CHECKS_TMP=""
+  fi
 }
 
 finalize() {

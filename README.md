@@ -59,7 +59,7 @@ jobs:
           publish_review_comment: "true"
 ```
 
-**Requirements:** the repository under review is already checked out; the runner has `gh`, `jq`, `curl`, `git`, and `python3`; the workflow runs on `pull_request` events (or passes explicit `repo` and `pr_number` inputs).
+**Requirements:** the repository under review is already checked out; the runner has `gh`, `jq`, `curl`, `git`, `python3`, and `pgrep` (procps on Linux, built in on macOS); the workflow runs on `pull_request` events (or passes explicit `repo` and `pr_number` inputs). `pgrep` is validated before the review starts because the concurrent CI/deep-review gates use it to reap their forked process tree on abnormal exit.
 
 ## 📚 Table of contents
 
@@ -516,6 +516,8 @@ When `ai_api_format: anthropic` is set, the action posts to `/messages`, sends t
 Set `ci_status_check: true` to wait for all CI checks to reach a terminal state before starting the AI review. This ensures the review considers the final CI results rather than running against in-progress checks.
 
 The per-check outcomes (name, status, conclusion) are also folded into the review corpus as a **CI Check Results** section, so the model cites real test/lint results instead of reporting them as "not verifiable". The reviewer never runs your test suite itself — that would mean executing untrusted PR code with the bot's token — it consumes the results your CI already produced in its own sandbox.
+
+When `deep_review` is also enabled, the advisory specialist passes run **concurrently** with the CI wait instead of after it: the two branches fork after the unchanged-review precheck and are joined before the final reviewer starts, so wall clock composes near `max(CI, specialists)` rather than their sum. The final reviewer still sees the finalized CI evidence plus any usable specialist leads; a CI timeout/failure never blocks the review (same as before), and specialists stay advisory and fail-soft. When CI completes first only the specialists are awaited, and vice versa. The CI wait runs in a least-privilege child process (`env -i` plus an explicit allowlist of CI/runner variables), so moving it into the review step does not expose model, tool, or Linear credentials to it. On an abnormal review exit (failed step, cancellation, TERM/INT) any gate process tree still running — the wrapper, the workload, and its subprocesses — is terminated and reaped with a bounded grace period.
 
 ```yaml
 - uses: misospace/pr-reviewer-action@v2
