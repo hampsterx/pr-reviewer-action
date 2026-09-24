@@ -293,6 +293,107 @@ The `eval-harness` workflow has two triggers:
 The JSON report is uploaded as the `eval-report` artifact on every run
 (including failed runs) so regressions can be diffed week-over-week.
 
+### Merge-safety disposition scoring (#661)
+
+Every semantic run carries two **independent** verdicts:
+
+- **Review quality** (`passed`, aggregated into scenario `pass_rate` over
+  *reviewer runs only*) — whether the output actually satisfies the scenario:
+  capability hits, evidence anchors, stage/route applicability, negative
+  controls, and — on vulnerable scenarios — a `correct` merge-safety
+  disposition. A found-but-suppressed or badly repaired detection is a miss,
+  never a pass.
+- **Disposition calibration** (`disposition_calibration_pass`, aggregated into
+  `disposition_calibration_rate`) — whether the scorer classified a REFERENCE
+  (answer-key) fixture into its declared `expected_disposition`. Fixtures that
+  declare the field are marked `calibration_run`, never counted as reviewer
+  successes, and excluded from `pass_rate`, evidence rates, and cost averages
+  (`reviewer_runs` / `calibration_runs` split the accounting). A misclassified
+  calibration fixture still fails the corpus gate: the overall `passed`
+  requires both `pass_rate == 1.0` (reviewer runs) and calibration rate
+  `== 1.0`, so deliberately bad answer-key outputs are exercised by CI without
+  ever inflating the headline success rate.
+
+The disposition itself — reported per run, per scenario
+(`merge_safety_disposition_counts` for reviewer outputs,
+`merge_safety_calibration_disposition_counts` for the answer key, and in the
+summary, with `merge_safety_suppressed_pre_existing_runs` /
+`merge_safety_invalid_remediation_runs` describing observed reviewer outputs
+only) — explains *why* the run found or missed the defect:
+
+- `correct` — defect found, and any recommended remediation satisfies the
+  scenario's `remediation_expectations` (`required` substrings every proposal
+  must cover, `forbidden` repair shapes — the wrapper-only lifecycle repair,
+  the keep-the-silent-fallback repair — that always fail);
+- `not_found` — the causal chain never fired;
+- `suppressed_pre_existing` — the defect was found but waved off as
+  pre-existing to the targeted commit in the same sentence (sentence-local:
+  attribution language plus an explicit decline; re-asserting the merge
+  blocker overrides the suppression reading, so attribution metadata alone
+  stays `correct`). Counted as a miss, never a pass;
+- `invalid_remediation` — correct detection, but the recommended fix is a
+  forbidden repair shape or misses a required element;
+- `speculative_false_positive` — a finding that asserts or hedges a defect the
+  causal chain does not support.
+
+Live runs never declare `expected_disposition`, so every live run is a
+reviewer run; its disposition is telemetry.
+
+### Semantic judge instrument (on-demand; never in normal CI)
+
+The deterministic scorer above stays the CI regression gate. Because a curated
+phrase vocabulary cannot recognise a semantically correct detection phrased in
+new words, live A/B measurement uses a separate, answer-key-calibrated **LLM
+judge** instead. It is a measurement instrument only — it never runs in normal
+CI and never affects a review verdict.
+
+- **`pr_reviewer/semantic_judge.py`** — pure primitives: the frozen judge system
+  prompt (`JUDGE_PROMPT_VERSION`), rubric rendering from a calibration
+  scenario's `answer_key`, `blind_response` (strict allowlist that strips
+  arm/mode/rep/route identity so the judge cannot see which side of an A/B a
+  response came from), tolerant strict-JSON parsing, and verbatim-citation
+  validation (every cited span must appear in the reviewer output, with only
+  case/inline-backticks/curly-quote normalisation — a fabricated citation is
+  discarded, fail-closed).
+- **`evals/judge-calibration-corpus.json`** — the judge's calibration and
+  adversarial suite: the offline answer-key references from
+  `evals/corpus-historical-dogfood.json` copied verbatim, plus paraphrase and
+  near-miss fixtures authored from the answer-key mechanisms. Rubric language is
+  derived only from those fixtures — never from live reviewer outputs.
+- **`scripts/run_judge_calibration.py`** — drives the judge over that suite and
+  gates on **100% disposition agreement** before the judge may be used for live
+  measurement. The first attempt runs at temperature 0.0; a retry (transport
+  fault, unparseable output, or a citation that does not appear verbatim — never
+  a well-formed verdict that merely disagrees) re-rolls at a higher temperature,
+  because at temperature 0 an output-adherence glitch reproduces identically.
+  Run it against an OpenAI-compatible endpoint:
+
+  ```bash
+  python3 scripts/run_judge_calibration.py \
+      --judge-model "$JUDGE_MODEL" --base-url "$JUDGE_BASE_URL" \
+      --api-key "$JUDGE_API_KEY" --output judge-calibration-report.json
+  ```
+
+- **`scripts/live_judge_score.py`** — scores blinded live A/B outputs
+  (`--baseline` / `--treatment`, each `{"arm", "reps", "scenarios": [{"scenario",
+  "runs": [{"rep", "response"}]}]}`) with the same frozen judge and reports, per
+  arm, the vulnerable-fixture detection rate, the disposition breakdown, and the
+  negative-control false-positive rate. Two fail-closed guards: it refuses to
+  score unless the arms are structurally comparable (each declares its
+  `arm` role; identical scenario set; no duplicate scenario or rep ids; identical
+  rep ids/counts per scenario), and it requires a `--calibration-artifact`
+  (a `run_judge_calibration.py` report) proving 100% agreement with the *same*
+  judge identity — prompt version, model, settings, and calibration corpus
+  content hash — as this run. An unusable judge verdict is fail-closed and
+  counted as a miss, never a pass.
+
+Model/endpoint caveats found while validating: reasoning judges need a generous
+completion budget (reasoning tokens count against it — a 1024-token budget
+returned `finish_reason=length` with empty content on long inputs), and some
+providers drop the leading JSON brace under `response_format=json_object`, so
+pick a judge whose output the strict parser accepts at the suite's runtime
+settings.
+
 ### Offline semantic corpus
 
 The historical semantic gate is deterministic and never contacts GitHub, a model,
