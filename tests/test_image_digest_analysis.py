@@ -164,6 +164,103 @@ class TestFetchAllMetadata:
 
 
 class TestResolveCompareRepo:
+    @pytest.mark.parametrize(
+        "repo",
+        [
+            "evil-docker.io/acme/app",
+            "evil-ghcr.io/acme/app",
+            "docker.io.evil/acme/app",
+            "ghcr.io@evil.example/acme/app",
+            "ghcr.io/acme%2fother/app",
+            "ghcr.io/acme/../app",
+            "ghcr.io/acme//app",
+            "ghcr.io/acme/%2e%2e/app",
+            "ghcr.io/acme/%00app",
+            "ghcr.io/acme/app?next=evil",
+        ],
+    )
+    def test_registry_targets_rejects_misleading_hosts_and_paths(self, repo):
+        with pytest.raises(ValueError):
+            ida.registry_targets(repo)
+
+    @pytest.mark.parametrize(
+        "repo",
+        [
+            "evil-docker.io/acme/app",
+            "evil-ghcr.io/acme/app",
+            "docker.io.evil/acme/app",
+            "ghcr.io@evil.example/acme/app",
+            "ghcr.io/acme%2fother/app",
+            "ghcr.io/acme/../app",
+            "ghcr.io/acme//app",
+            "ghcr.io/acme/%2e%2e/app",
+            "ghcr.io/acme/%00app",
+        ],
+    )
+    def test_image_heuristic_rejects_misleading_hosts_and_paths(self, repo):
+        assert ida.guess_repo_from_image(repo) is None
+
+    @pytest.mark.parametrize(
+        "repo",
+        [
+            "ghcr.io/acme/%2e%2e/app",
+            "ghcr.io/acme/%00app",
+            "ghcr.io/acme//app",
+        ],
+    )
+    def test_fetch_invalid_repository_never_calls_http(self, repo):
+        def fail_http_json(url, headers=None):
+            raise AssertionError(f"network should not be touched for {repo}: {url}")
+
+        with mock.patch.object(ida, "http_json", fail_http_json):
+            result = ida.fetch_digest_metadata(repo, DIGEST_A)
+        assert "invalid repository path" in result["error"]
+
+    @pytest.mark.parametrize(
+        ("image", "path", "expected_base", "guess"),
+        [
+            ("nginx", "library/nginx", "https://registry-1.docker.io", "library/nginx"),
+            ("docker.io/nginx", "library/nginx", "https://registry-1.docker.io", "library/nginx"),
+            ("owner/app", "owner/app", "https://registry-1.docker.io", "owner/app"),
+            ("docker.io/owner/app", "owner/app", "https://registry-1.docker.io", "owner/app"),
+            ("ghcr.io/owner/app", "owner/app", "https://ghcr.io", "owner/app"),
+        ],
+    )
+    def test_registry_canonical_paths_and_compare_guesses(self, image, path, expected_base, guess):
+        repo_path, token_url, base_url = ida.registry_targets(image)
+        assert repo_path == path
+        assert base_url == expected_base
+        from urllib.parse import parse_qs, urlsplit
+        assert parse_qs(urlsplit(token_url).query)["scope"] == [f"repository:{path}:pull"]
+        assert ida.guess_repo_from_image(image) == guess
+
+    def test_fetch_uses_canonical_docker_hub_urls(self, monkeypatch):
+        ida._TOKEN_CACHE.clear()
+        urls = []
+
+        def fake_http_json(url, headers=None):
+            urls.append(url)
+            if "/token?" in url:
+                return {"token": "t"}
+            if "/manifests/" in url:
+                return {"config": {"digest": "sha256:config"}}
+            return {}
+
+        monkeypatch.setattr(ida, "http_json", fake_http_json)
+        for image in ("nginx", "docker.io/nginx", "owner/app", "docker.io/owner/app"):
+            result = ida.fetch_digest_metadata(image, DIGEST_A)
+            assert result["error"] is None
+        assert any("scope=repository:library%2Fnginx:pull" in url for url in urls)
+        assert any("/v2/library/nginx/manifests/" in url for url in urls)
+        assert any("scope=repository:owner%2Fapp:pull" in url for url in urls)
+        assert any("/v2/owner/app/manifests/" in url for url in urls)
+
+    @pytest.mark.parametrize("image", ["evil.io/app", "localhost/app", "host:5000/app"])
+    def test_explicit_unknown_registries_never_fall_back_to_docker_hub(self, image):
+        with pytest.raises(ValueError, match="unsupported registry"):
+            ida.registry_targets(image)
+        assert ida.guess_repo_from_image(image) is None
+
     def test_matching_labels(self):
         old = {"source": "https://github.com/acme/app"}
         new = {"source": "https://github.com/acme/app"}

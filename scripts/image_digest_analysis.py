@@ -48,33 +48,57 @@ def http_json(url, headers=None):
         raise RuntimeError(f"HTTP request failed: {exc}")
 
 
-def registry_targets(repo: str):
-    if repo.startswith("docker.io/"):
-        repo_path = repo[len("docker.io/") :]
-        token_url = (
-            "https://auth.docker.io/token?service=registry.docker.io&scope="
-            + parse.quote(f"repository:{repo_path}:pull", safe=":")
-        )
-        base_url = "https://registry-1.docker.io"
-        return repo_path, token_url, base_url
-    if repo.startswith("ghcr.io/"):
-        repo_path = repo[len("ghcr.io/") :]
-        token_url = "https://ghcr.io/token?scope=" + parse.quote(
-            f"repository:{repo_path}:pull", safe=":"
-        )
-        base_url = "https://ghcr.io"
-        return repo_path, token_url, base_url
-    if repo.count("/") == 1 and not repo.startswith(
-        ("quay.io/", "gcr.io/", "registry.k8s.io/")
-    ):
-        repo_path = repo
-        token_url = (
-            "https://auth.docker.io/token?service=registry.docker.io&scope="
-            + parse.quote(f"repository:{repo_path}:pull", safe=":")
-        )
-        base_url = "https://registry-1.docker.io"
-        return repo_path, token_url, base_url
+_REPOSITORY_COMPONENT = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$")
+
+
+def _valid_repository_path(path: str) -> bool:
+    # Registry paths are slash-separated lowercase components; reject URL
+    # syntax, percent-encoded separators, dot segments, and empty components.
+    return bool(path) and all(
+        _REPOSITORY_COMPONENT.fullmatch(component) for component in path.split("/")
+    )
+
+
+def _registry_and_path(repo: str):
+    if not isinstance(repo, str) or not repo:
+        raise ValueError("unsupported registry for repo")
+    parts = repo.split("/")
+    first = parts[0]
+    # Docker image references distinguish a registry by punctuation in the
+    # first component, not merely by its position in an allowlist.
+    explicit_registry = len(parts) > 1 and (
+        "." in first or ":" in first or first == "localhost"
+    )
+    if explicit_registry:
+        if first not in {"docker.io", "ghcr.io"}:
+            raise ValueError(f"unsupported registry for repo {repo}")
+        path = "/".join(parts[1:])
+        if not _valid_repository_path(path):
+            raise ValueError(f"invalid repository path for {first}")
+        if first == "docker.io" and "/" not in path:
+            path = f"library/{path}"
+        return first, path
+    if not _valid_repository_path(repo):
+        raise ValueError(f"invalid repository path for docker.io")
+    if len(parts) == 1:
+        return "docker.io", f"library/{repo}"
+    if len(parts) == 2:
+        return "docker.io", repo
     raise ValueError(f"unsupported registry for repo {repo}")
+
+
+def registry_targets(repo: str):
+    registry, repo_path = _registry_and_path(repo)
+    if registry == "docker.io":
+        token_url = (
+            "https://auth.docker.io/token?service=registry.docker.io&scope="
+            + parse.quote(f"repository:{repo_path}:pull", safe=":")
+        )
+        return repo_path, token_url, "https://registry-1.docker.io"
+    token_url = "https://ghcr.io/token?scope=" + parse.quote(
+        f"repository:{repo_path}:pull", safe=":"
+    )
+    return repo_path, token_url, "https://ghcr.io"
 
 
 # Anonymous pull tokens are scoped per repository, so one token serves every
@@ -183,12 +207,10 @@ def github_repo_from_source(source: Optional[str]):
 
 
 def guess_repo_from_image(image_repo: str):
-    if image_repo.startswith("docker.io/"):
-        tail = image_repo[len("docker.io/") :]
-    elif image_repo.startswith("ghcr.io/"):
-        tail = image_repo[len("ghcr.io/") :]
-    else:
-        tail = image_repo
+    try:
+        registry, tail = _registry_and_path(image_repo)
+    except (AttributeError, ValueError):
+        return None
     parts = tail.split("/")
     if len(parts) >= 2:
         return f"{parts[0]}/{parts[1]}"
