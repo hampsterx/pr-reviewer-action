@@ -2,6 +2,7 @@ import { validateContract } from "./config/contract.js";
 import { loadConfig } from "./config/load-config.js";
 import { toJSON } from "./config/types.js";
 import { assertSupportedNode } from "./runtime/node-version.js";
+import { runRequestBuilderMode, runVerdictParserMode } from "./modes/parity.js";
 import { runPrecheckFixture } from "./precheck/index.js";
 import { V3_CONTRACT } from "../.v3-generated/contract.generated.js";
 
@@ -26,11 +27,20 @@ export async function precheckFixtureMain(fixturePath: string): Promise<void> {
 
 if (require.main === module) {
   const argv = process.argv.slice(2);
-  if (argv[0] === "precheck-fixture") {
+  const mode = process.env.PR_REVIEWER_V3_MODE ?? "";
+  const firstArg = argv[0] ?? "";
+  if (firstArg === "precheck-fixture") {
     precheckFixtureMain(argv[1] ?? "").catch((error: unknown) => {
       process.stderr.write(`v3 precheck fixture error: ${error instanceof Error ? error.message : "unknown error"}\n`);
       process.exitCode = 1;
     });
+  } else if (mode === "v3-request-builder" && firstArg) {
+    runRequestBuilderMode(firstArg);
+  } else if (mode === "v3-verdict-parser" && firstArg) {
+    runVerdictParserMode(firstArg);
+  } else if (mode !== "") {
+    process.stderr.write(`v3 runtime: unknown parity mode '${mode}'\n`);
+    process.exitCode = 1;
   } else {
     try {
       main();
