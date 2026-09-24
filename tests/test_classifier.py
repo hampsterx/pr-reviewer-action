@@ -218,6 +218,41 @@ class TestPRKindPathHandlingChanges:
         kind = _classify_pr_kind(files, pattern)
         assert kind == "path_handling_changes"
 
+    def test_esm_import_specifiers_are_not_traversal(self):
+        # #679 review false positive: a cross-directory TypeScript import is
+        # module resolution, not filesystem traversal.
+        diff = "\n".join([
+            '+import { runProcess } from "../runtime/subprocess.js";',
+            '+} from "../gates/gates.js";',
+            '+const mod = require("../lib/util.js");',
+            '+await import("../lib/lazy.js");',
+        ])
+        assert _classify_pr_kind([_make_file("src/runtime/subprocess.ts")], diff) == "app_code"
+
+    def test_doc_prose_is_not_a_path_signal(self):
+        diff = "+The helper sanitizes all user-provided paths before use.\n"
+        assert _classify_pr_kind([_make_file("README.md")], diff) == "app_code"
+
+    def test_identifier_shaped_path_code_still_fires(self):
+        diff = "+def sanitize_path(p):\n+    return resolvePath(p)\n"
+        assert _classify_pr_kind([_make_file("src/x.py")], diff) == "path_handling_changes"
+
+    def test_same_line_specifier_and_traversal_still_fires(self):
+        # Specifier neutralization is literal-scoped: a real traversal on the
+        # same source line as a require/import specifier must still count.
+        diff = "\n".join([
+            '+const x = require("../lib"); fs.readFile("../../etc/passwd");',
+            '+import { a } from "../lib"; fs.readFile("../../etc/shadow");',
+            '+import { runProcess } from "../runtime/subprocess.js";',
+        ])
+        files = [_make_file("src/app.ts")]
+        assert _classify_pr_kind(files, diff) == "path_handling_changes"
+        flags, attribution = _detect_risk_flags(files, diff, [])
+        assert "path_handling_changes" in flags
+        checks = _build_must_check("app_code", ["path_handling_changes"])
+        assert any("path traversal" in c for c in checks)
+        assert any("edge-case paths" in c for c in checks)
+
 
 class TestPRKindSecretHandlingChanges:
     @pytest.mark.parametrize("fname", [
