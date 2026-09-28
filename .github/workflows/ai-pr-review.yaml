@@ -102,3 +102,135 @@ jobs:
           non_blocking_finding_categories: tests,docs,style,question
           publish_mode: review_verdict
           allow_approve: "true"
+
+      - name: Build v3 runtime (shadow)
+        # The #809 shadow comparison: build the v3 TypeScript runtime from
+        # the same checkout the v2 review just ran from, then re-run the
+        # review through the v3 entry beside v2. Dogfood only — nothing here
+        # publishes. A build failure fails the job like any other broken
+        # head; the shadow RUN itself is the diagnostic and never gates.
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && steps.review.outputs.should_review == 'true'
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Run v3 shadow review (never publishes)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && steps.review.outputs.should_review == 'true'
+        # Diagnostics, not a gate: a shadow failure uploads nothing and never
+        # blocks the merge (unlike the build step, which reflects the head).
+        continue-on-error: true
+        env:
+          # The v2 production run already consumed the shared env file; the
+          # shadow rebuilds its bindings from the same workflow sources.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AI_BASE_URL: ${{ vars.LITELLM_URL }}
+          AI_API_FORMAT: ${{ vars.PRIMARY_FORMAT }}
+          AI_MODEL: ${{ vars.PRIMARY_MODEL }}
+          AI_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          AI_MAX_TOKENS: "32768"
+          AI_RESPONSE_FORMAT: json_object
+          AI_FALLBACK_BASE_URL: ${{ vars.LITELLM_URL }}
+          AI_FALLBACK_API_FORMAT: ${{ vars.FALLBACK_FORMAT }}
+          AI_FALLBACK_MODEL: ${{ vars.FALLBACK_MODEL }}
+          AI_FALLBACK_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          AI_PRIMARY_RETRIES: "3"
+          AI_PRIMARY_RETRY_DELAY_SEC: "15"
+          REVIEW_ROUTING_MODE: auto
+          AI_SMART_BASE_URL: ${{ vars.LITELLM_URL }}
+          AI_SMART_API_FORMAT: ${{ vars.SMART_FORMAT }}
+          AI_SMART_MODEL: ${{ vars.SMART_MODEL }}
+          AI_SMART_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          CONTEXT_LIMIT_MODE: normal
+          CI_STATUS_CHECK: "true"
+          CI_TIMEOUT_SEC: "600"
+          DEEP_REVIEW: "true"
+          TOOL_MODE: native_loop
+          TOOL_MAX_ROUNDS: "4"
+          PRIMARY_TOOL_MAX_REQUESTS: "16"
+          TOOL_LOOP_WALL_CLOCK_SEC: "600"
+          TOOL_TURN_TIMEOUT_SEC: "300"
+          TOOL_MAX_TOKENS_PER_TURN: "16000"
+          TOOL_MAX_RESPONSE_BYTES: "12000"
+          TOOL_ALLOWED_GH_API_REPOS: misospace/pr-reviewer-action
+          TOOL_REQUEST_TIMEOUT_SEC: "15"
+          TOOL_ENABLE_FOR_FORKS: "false"
+          ON_MODEL_FAILURE: notice
+          VERDICT_POLICY: findings_severity_gated
+          NON_BLOCKING_FINDING_CATEGORIES: tests,docs,style,question
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          SHADOW_DIR="$(mktemp -d "$RUNNER_TEMP/v3-shadow.XXXXXX")"
+          echo "$SHADOW_DIR" > "$RUNNER_TEMP/v3-shadow-dir"
+          PR_REVIEWER_RUN_DIR="$SHADOW_DIR" node scripts/v3_shadow_run.mjs run
+
+      - name: Compare v3 shadow against v2
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && steps.review.outputs.should_review == 'true'
+        # Same diagnostics-only contract as the run step.
+        continue-on-error: true
+        env:
+          SHADOW_V2_VERDICT: ${{ steps.review.outputs.verdict }}
+          SHADOW_V2_VERDICT_SOURCE: ${{ steps.review.outputs.verdict_source }}
+          SHADOW_V2_REVIEW_ROUTE: ${{ steps.review.outputs.review_route }}
+          SHADOW_V2_ESCALATION_REASON: ${{ steps.review.outputs.escalation_reason }}
+          SHADOW_V2_REQUIRED_CHECKS: ${{ steps.review.outputs.required_checks }}
+          SHADOW_V2_ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
+          SHADOW_V2_CACHE_HIT_RATIO: ${{ steps.review.outputs.cache_hit_ratio }}
+          SHADOW_V2_FINDINGS: ${{ steps.review.outputs.findings }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          SHADOW_DIR="$(cat "$RUNNER_TEMP/v3-shadow-dir" 2>/dev/null || true)"
+          if [ -z "$SHADOW_DIR" ] || [ ! -d "$SHADOW_DIR" ]; then
+            echo "no shadow run directory; nothing to compare"
+            exit 0
+          fi
+          PR_REVIEWER_RUN_DIR="$SHADOW_DIR" SHADOW_REPORT="$SHADOW_DIR/shadow-comparison.md" node scripts/v3_shadow_run.mjs compare
+
+      - name: Upload v3 shadow run
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && steps.review.outputs.should_review == 'true'
+        # Diagnostics-only (continue-on-error): the run step may have failed
+        # before writing the shadow directory. The upload is a fixed
+        # allowlist of known-text artifacts the run itself produced — never
+        # a directory walk — so there is no symlink traversal, no binary
+        # content, and the secret scan runs over exactly those files with a
+        # fixed-string match on each token and its base64 form (GitHub also
+        # masks secret values in logs).
+        continue-on-error: true
+        env:
+          SHADOW_TOKENS: ${{ secrets.LITELLM_API_KEY }} ${{ steps.app-token.outputs.token }}
+        run: |
+          SHADOW_DIR="$(cat "$RUNNER_TEMP/v3-shadow-dir" 2>/dev/null || true)"
+          if [ -z "$SHADOW_DIR" ] || [ ! -d "$SHADOW_DIR" ]; then
+            echo "no shadow run directory; nothing to upload"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/v3-shadow-artifacts"
+          NAMES="shadow-comparison.md shadow-outputs.txt ai-output.json tool-harness.json review-corpus.truncated.md"
+          LEAKS=0
+          for name in $NAMES; do
+            [ -f "$SHADOW_DIR/$name" ] || continue
+            for token in $SHADOW_TOKENS; do
+              [ -n "$token" ] || continue
+              encoded="$(printf '%s' "$token" | base64 -w0)"
+              if grep -qF -e "$token" -e "$encoded" -- "$SHADOW_DIR/$name" 2>/dev/null; then
+                echo "::warning::redacting $name (contained a token value)"
+                rm -f -- "$SHADOW_DIR/$name"
+                LEAKS=$((LEAKS + 1))
+                break
+              fi
+            done
+          done
+          echo "secret scan: $LEAKS artifact(s) redacted"
+          for name in $NAMES; do
+            cp "$SHADOW_DIR/$name" "$RUNNER_TEMP/v3-shadow-artifacts/" 2>/dev/null || true
+          done
+          echo "shadow run directory: $SHADOW_DIR"
+          # The report embeds PR-derived text: suspend workflow commands so
+          # it cannot inject ::commands:: into the job log.
+          STOP_TOKEN="shadow-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$STOP_TOKEN"
+          echo "shadow comparison:" && cat "$RUNNER_TEMP/v3-shadow-artifacts/shadow-comparison.md" 2>/dev/null || true
+          echo "::$STOP_TOKEN::"
