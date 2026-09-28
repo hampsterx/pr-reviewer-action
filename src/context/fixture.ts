@@ -40,7 +40,9 @@ import {
   renderRelatedContextJson,
   renderRelatedContextMarkdown,
 } from "./related-context.js";
-import { buildImageProvenanceContext, parseDiff, type DigestChange } from "./image-provenance.js";
+import { buildImageProvenanceContext, parseDiff, type DigestChange, type HttpJson } from "./image-provenance.js";
+import { createImageHttpJson } from "./image-transport.js";
+import type { ExchangeRequest, ExchangeResponse } from "../platform/safe-fetch.js";
 import { changeAnchorsCli, extractChangeAnchors, renderChangeAnchorsJson } from "./change-anchors.js";
 
 interface FixtureRecord {
@@ -234,25 +236,58 @@ interface HttpRoute {
   match: string;
   body?: unknown;
   error?: string;
+  /** Transport fixtures: HTTP status (default 200) and a raw body text. */
+  status?: number;
+  raw?: string;
+  /** Transport fixtures: answer 302 to this Location. */
+  redirect?: string;
 }
 
 interface ImageProvenanceFixture extends FixtureRecord {
   diff?: string;
   http?: HttpRoute[];
+  /** Serve the routes at the fetch level through the real transport
+   * (image-transport.ts) instead of at the httpJson seam. */
+  transport?: boolean;
+  /** Transport fixtures: DNS answers by hostname (default one public IP). */
+  dns?: Record<string, string[]>;
 }
 
 export async function runImageProvenanceFixture(fixturePath: string): Promise<{ ok: boolean; values?: Record<string, string>; stderr?: string }> {
   const fixture = loadFixture(fixturePath) as ImageProvenanceFixture;
   const routes = Array.isArray(fixture.http) ? fixture.http : [];
-  const httpJson = async (url: string): Promise<unknown> => {
-    for (const route of routes) {
-      if (typeof route.match === "string" && url.includes(route.match)) {
-        if (typeof route.error === "string") throw new Error(route.error);
-        return route.body ?? null;
+  const requests = new Set<string>();
+  let httpJson: HttpJson;
+  if (fixture.transport === true) {
+    // The real transport end to end: #808's safeFetchLike (public-only DNS,
+    // pinned connect) over a fixture resolver and exchange. The request log
+    // uses the v2 curl stub's vocabulary: explicit Authorization, Accept
+    // (curl's implicit default when absent), and the User-Agent only for
+    // GitHub (curl's own default UA is not comparable).
+    const dns = fixture.dns ?? {};
+    const resolver = async (host: string): Promise<string[]> => dns[host] ?? ["93.184.216.34"];
+    const exchange = async (request: ExchangeRequest): Promise<ExchangeResponse> => {
+      const url = request.url;
+      const ua = url.startsWith("https://api.github.com/") ? ` ua=${request.headers["user-agent"] ?? "-"}` : "";
+      requests.add(`GET ${url} auth=${request.headers.authorization ?? "-"} accept=${request.headers.accept ?? "*/*"}${ua}`);
+      const route = routes.find((candidate) => typeof candidate.match === "string" && url.includes(candidate.match));
+      if (route === undefined) return { status: 404, headers: {}, body: Buffer.from('{"message": "Not Found"}') };
+      if (typeof route.redirect === "string") return { status: 302, headers: { location: route.redirect }, body: Buffer.alloc(0) };
+      const text = typeof route.raw === "string" ? route.raw : JSON.stringify(route.body ?? null);
+      return { status: route.status ?? 200, headers: {}, body: Buffer.from(text, "utf8") };
+    };
+    httpJson = createImageHttpJson({ resolver, exchange });
+  } else {
+    httpJson = async (url: string): Promise<unknown> => {
+      for (const route of routes) {
+        if (typeof route.match === "string" && url.includes(route.match)) {
+          if (typeof route.error === "string") throw new Error(route.error);
+          return route.body ?? null;
+        }
       }
-    }
-    throw new Error(`no fixture route for ${url}`);
-  };
+      throw new Error(`no fixture route for ${url}`);
+    };
+  }
   const diffText = typeof fixture.diff === "string" ? fixture.diff : "";
   const changes: DigestChange[] = parseDiff(diffText);
   const markdown = await buildImageProvenanceContext(diffText, httpJson);
@@ -267,6 +302,7 @@ export async function runImageProvenanceFixture(fixturePath: string): Promise<{ 
         new_digest: change.newDigest,
       }))),
       markdown,
+      ...(fixture.transport === true ? { requests: [...requests].sort().join("\n") } : {}),
     },
   };
 }

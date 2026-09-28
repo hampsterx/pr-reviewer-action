@@ -5,6 +5,7 @@ export {
   MAX_PROVIDER_FINDINGS,
   normalizeSeverity,
   parseProviderFindings,
+  providerCaptureCap,
   runEvidenceProvider,
   severityRank,
   type EvidenceProviderEntry,
@@ -13,3 +14,34 @@ export {
   type ProviderSpec,
   type RunEvidenceProviderOptions,
 } from "./providers.js";
+export {
+  EVIDENCE_JSON_FILE,
+  EVIDENCE_MARKDOWN_FILE,
+  FAILURE_FALLBACK_JSON,
+  FAILURE_FALLBACK_MARKDOWN,
+  FORK_SKIP_JSON,
+  FORK_SKIP_MARKDOWN,
+  MAX_CONFIGURED_PROVIDERS,
+  evidenceForkGateApplies,
+  headTailCap,
+  runEvidenceProviders,
+  runEvidenceProvidersPhase,
+  writeEvidenceArtifacts,
+  type EvidenceEntry,
+  type EvidencePhaseOptions,
+  type EvidencePhaseOutcome,
+  type EvidenceRunOptions,
+  type EvidenceSummary,
+} from "./orchestrate.js";
+export {
+  MAX_FINDINGS as SARIF_MAX_FINDINGS,
+  MAX_INPUT_BYTES as SARIF_MAX_INPUT_BYTES,
+  normalizeSarif,
+  sarifProviderEntry,
+  splitSarifPaths,
+  workspacePath,
+  type SarifArtifact,
+  type SarifEvidenceEntry,
+  type SarifFinding,
+} from "./sarif.js";
+export { PyFloat, PyUncaughtError, pyJsonDumps, pyJsonLoads } from "./pyjson.js";
