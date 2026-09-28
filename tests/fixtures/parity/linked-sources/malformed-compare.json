@@ -1,0 +1,32 @@
+{
+  "fixture": "malformed-compare",
+  "description": "A hostile compare payload with commits: null: v2 slices None and raises TypeError; the v3 port throws the same exception kind.",
+  "input": {
+    "urls": [
+      "https://github.com/o/r/compare/a...b"
+    ],
+    "allowed_source_hosts": "",
+    "target_version": "",
+    "ghcr_images": [],
+    "compare_shas": null,
+    "github_repository": "o/r"
+  },
+  "dns": {},
+  "routes": [
+    {
+      "match": "repos/o/r/compare/a...b",
+      "body": {
+        "status": "ahead",
+        "commits": null
+      }
+    }
+  ],
+  "golden": {
+    "error": "TypeError: 'NoneType' object is not subscriptable"
+  },
+  "v3_golden": {
+    "markdown": "## Source 1\nURL: https://github.com/o/r/compare/a...b\n\n### Fetched Content (truncated)\n(Skipped non-allowlisted URL: github.com)\n\n### GitHub Compare Metadata: o/r@a...b\n```json\n{\n  \"html_url\": null,\n  \"status\": \"ahead\",\n  \"ahead_by\": null,\n  \"behind_by\": null,\n  \"total_commits\": null,\n  \"commits\": []\n}\n\n```\n### GitHub Compare Files\n```json\n[]\n\n```\n\n\n### GitHub Releases Enrichment: o/r\n(Could not fetch releases list for o/r)\n",
+    "requests": "[\"GET https://api.github.com/repos/o/r/compare/a...b auth=0\",\"GET https://api.github.com/repos/o/r/releases?per_page=30 auth=0\"]",
+    "budget_warnings": "0"
+  }
+}

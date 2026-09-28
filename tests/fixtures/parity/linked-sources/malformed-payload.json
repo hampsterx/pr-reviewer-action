@@ -1,0 +1,40 @@
+{
+  "fixture": "malformed-payload",
+  "description": "A hostile releases payload whose elements are not objects: v2's `.get` raises AttributeError out of render_linked_sources; the v3 port throws the same exception kind.",
+  "input": {
+    "urls": [
+      "https://github.com/o/r/releases/tag/v1"
+    ],
+    "allowed_source_hosts": "",
+    "target_version": "",
+    "ghcr_images": [],
+    "compare_shas": null,
+    "github_repository": "o/r"
+  },
+  "dns": {},
+  "routes": [
+    {
+      "match": "repos/o/r/releases/tags/v1",
+      "body": {
+        "tag_name": "v1"
+      }
+    },
+    {
+      "match": "repos/o/r/releases?per_page=30",
+      "body": [
+        [
+          "tag_name"
+        ],
+        "x"
+      ]
+    }
+  ],
+  "golden": {
+    "error": "AttributeError: 'list' object has no attribute 'get'"
+  },
+  "v3_golden": {
+    "markdown": "## Source 1\nURL: https://github.com/o/r/releases/tag/v1\n\n### Fetched Content (truncated)\n(Skipped non-allowlisted URL: github.com)\n\n### GitHub Release Metadata: o/r@v1\n```json\n{\n  \"tag_name\": \"v1\"\n}\n\n```\n### Recent Releases\n```json\n[\n  {}\n]\n\n```\n\n\n### GitHub Releases Enrichment: o/r\n#### Recent Releases (tags)\n```json\n[\n  {}\n]\n\n```\n",
+    "requests": "[\"GET https://api.github.com/repos/o/r/releases/tags/v1 auth=0\",\"GET https://api.github.com/repos/o/r/releases?per_page=30 auth=0\"]",
+    "budget_warnings": "0"
+  }
+}
