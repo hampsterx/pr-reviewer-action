@@ -628,6 +628,50 @@ disagree with production. Not modeled: NUL bytes in a PR title or body (GNU
 Linear payload shapes that crash the Python adapter (a non-dict `state`,
 `labels` or `data`); v3 treats those as absent fields.
 
+### The `ci-gate` and `specialists-gate` boundaries (#706 PR 6)
+
+`ci-gate` runs the real `scripts/wait_for_ci.sh` against stub
+`gh`/`curl`/`date`/`sleep` binaries that share a virtual clock (only the poll
+loop's own `sleep` advances it; the `_gh_api_bounded` watchdog sleeps for
+real), and the v3 `gate-ci` workload over an injected fetch and the same
+clock. Fixtures serve per-route response sequences and compare exit code,
+`$GITHUB_OUTPUT`, the `ci-checks-context.md` bytes, leftover temp files, the
+request log, elapsed virtual time and the log lines.
+
+The first approved divergence is the commit-status quirk above: the v3 CI gate
+reads with `transientAsUnknown`, so no response, HTTP 429/5xx, or a non-JSON
+body on either read is "unknown, retry" instead of `[]`. v2 could finalize
+`none` (or a partial list) while CI was still running. It is pinned for the
+GitHub and Forgejo `transient-status-read` fixtures. The head SHA stays
+pinned once for the whole wait, as in v2; a head that moves mid-wait is the
+publish boundary's exact-head guard's problem, not the CI gate's.
+
+The second (`hostile-check-names`): v2 wrote check names raw into the
+evidence table, so a name with `|`, a newline plus a forged `## heading`, or
+control characters split rows. v3 escapes every cell (`escapeTableCell`):
+control runs become one space, `\` `|` and backticks are backslash-escaped,
+and `&` `<` `>` become entities, so the table keeps one row per check.
+
+`specialists-gate` runs `scripts/run_specialists.py` (curl transport) and the
+v3 `gate-specialists` workload (v3 model transport) against local mock model
+endpoints serving the same per-role responses, and compares every artifact
+byte for byte. Only `elapsed_sec` values and the mock port are normalized.
+Porting the glue surfaced three runner fixes, now matching v2: skipped
+aggregate entries carry v2's exact keys, `request_bytes` measures Python's
+`json.dumps` (ASCII-escaped, space-separated), and the contract's float fields
+serialize as Python floats (`0.0`, `1.0`). Float coercion is scoped by exact
+path per artifact (`temperature` in a request, `aggregate_elapsed_sec` and
+`roles[].elapsed_sec` in `specialists.json`), never by bare key name: raw
+provider response bodies are written as v2's `json.dumps(json.loads(body))`,
+so a same-named integer field in them stays an integer
+(`raw-response-integer-fields`). Later fixes, also
+matching v2: a role's request artifact is recorded before its first attempt,
+so a role reaped at the phase deadline still leaves it (`phase-deadline-reap`);
+a failed combined scout leaves `specialist-scout.request.json` and no
+response artifact (`combined-scout-failed`); timeout failures carry the
+`timeout:` message in the role and response artifacts; and an error-body
+message quotes the error as Python `str()` does, redacted.
+
 ## What #680 removed from the Python runtime surface
 
 `src/enforcement/`, `src/publish/`, and `src/metadata/` now own the
