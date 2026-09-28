@@ -26,6 +26,7 @@
 
 import { createHash } from "node:crypto";
 import { pythonJsonStringify } from "../precheck/metadata.js";
+import { HARNESS_SOURCE, obligationText } from "./obligations.js";
 
 export const ARTIFACT_VERSION = 1;
 
@@ -326,6 +327,10 @@ export interface LedgerInput {
   linkedIssuesMarkdown?: string | null | undefined;
   standardsText?: string | null | undefined;
   standardsRef?: string | null | undefined;
+  /** Harness-authored verification obligations (#796): appended after the
+   * extracted sources (they always outrank obligations), subject to the same
+   * MAX_REQUIREMENTS cap, dedup, and char bounds. */
+  harnessObligations?: readonly import("./obligations.js").HarnessObligation[] | undefined;
 }
 
 /** Build the version-1 requirement ledger from bounded review inputs. Never
@@ -396,8 +401,37 @@ export function extractRequirementLedger(input: LedgerInput = {}): RequirementLe
     }
   }
 
-  const omitted = Math.max(0, entries.length - MAX_REQUIREMENTS);
-  const kept = omitted > 0 ? entries.slice(0, MAX_REQUIREMENTS) : entries;
+  // Harness obligations (#796) go LAST: deterministic extraction always
+  // outranks them, and the MAX_REQUIREMENTS cap drops them first when the
+  // extracted set is full. Each obligation is an ordinary invariant entry
+  // (strict coverage contract applies unchanged), provenance is the changed
+  // site the question is anchored to, and duplicates of already-extracted
+  // requirements are dropped (first occurrence owns the entry).
+  // Eligible (non-duplicate) obligations the cap drops are omissions too,
+  // and must show in the truncation metadata like any other drop.
+  const omittedKeys = new Set<string>();
+  for (const obligation of input.harnessObligations ?? []) {
+    const { text, truncated } = obligationText(obligation);
+    const key = text.toLowerCase();
+    const index = indexByKey.get(key);
+    if (index !== undefined || omittedKeys.has(key)) continue;
+    if (entries.length >= MAX_REQUIREMENTS) {
+      omittedKeys.add(key);
+      continue;
+    }
+    indexByKey.set(key, entries.length);
+    entries.push({
+      id: requirementId(text),
+      text,
+      kind: "invariant",
+      verificationRequired: true,
+      truncated,
+      provenance: [{ source: HARNESS_SOURCE, ref: obligation.source || "harness", line: obligation.line }],
+    });
+  }
+
+  const omitted = Math.max(0, entries.length - MAX_REQUIREMENTS) + omittedKeys.size;
+  const kept = entries.length > MAX_REQUIREMENTS ? entries.slice(0, MAX_REQUIREMENTS) : entries;
   return {
     version: ARTIFACT_VERSION,
     sha: computeSha(kept),
