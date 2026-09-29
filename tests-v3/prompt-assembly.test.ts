@@ -13,7 +13,9 @@ import {
   UserMessageBuildError,
   annotateAnalysisEngine,
   applySpecialistLeadsFragment,
+  applySupersededDiscussionFragment,
   applySystemPromptFragments,
+  SUPERSEDED_DISCUSSION_GUIDANCE,
   buildUserMessage,
   handleModelFailure,
   jqRawPrKind,
@@ -212,4 +214,37 @@ test("rawFragment: a missing fragment fails loud with a typed error (v2's set -e
       name,
     );
   }
+});
+
+test("#812: the superseded-discussion rule appends once discussion sections exist", () => {
+  const guidance = SUPERSEDED_DISCUSSION_GUIDANCE;
+  // PR-thread section present: the rule is appended.
+  withWorkspace({ "pr-thread.md": "# PR Thread Context\n" }, (dir) => {
+    const ws = workspaceAt(dir);
+    const state = applySupersededDiscussionFragment(applySystemPromptFragments(resolveSystemPrompt({}, ws), {}, ws), ws);
+    assert.ok(state.systemPrompt.includes(guidance));
+    // Idempotent.
+    const again = applySupersededDiscussionFragment(state, ws);
+    assert.equal(again.systemPrompt.split(guidance).length - 1, 1);
+  });
+  // The review-threads section also counts as discussion.
+  withWorkspace({ "review-threads.md": "# Unresolved Review Threads\n" }, (dir) => {
+    const ws = workspaceAt(dir);
+    const state = applySupersededDiscussionFragment(applySystemPromptFragments(resolveSystemPrompt({}, ws), {}, ws), ws);
+    assert.ok(state.systemPrompt.includes(guidance));
+  });
+  // No discussion sections: no rule.
+  withWorkspace({}, (dir) => {
+    const ws = workspaceAt(dir);
+    const state = applySupersededDiscussionFragment(applySystemPromptFragments(resolveSystemPrompt({}, ws), {}, ws), ws);
+    assert.ok(!state.systemPrompt.includes(guidance));
+  });
+  // A replace-mode operator prompt is left untouched, like every fragment.
+  withWorkspace({ "pr-thread.md": "# PR Thread Context\n" }, (dir) => {
+    const ws = workspaceAt(dir);
+    const replaced = resolveSystemPrompt({ systemPrompt: "Operator prompt." }, ws);
+    assert.equal(replaced.isDefault, false);
+    const state = applySupersededDiscussionFragment(replaced, ws);
+    assert.equal(state.systemPrompt, "Operator prompt.");
+  });
 });

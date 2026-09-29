@@ -325,6 +325,13 @@ export function buildReviewCorpus(
     // repo-map.md carries its own trust-framed "# Repository Map" header.
     pushSection(undefined, artifacts.get("repo-map.capped.md")!);
   }
+  if (nonEmpty(ws.linkedIssuesMd)) {
+    // context.sh leaves linked-issues.md empty when there's no linked issue
+    // so the model sees no section boundary to react to. #812 ordering: the
+    // linked issues are authoritative context and come before every
+    // discussion section (PR conversation, review threads, human reviews).
+    pushSection("# Linked Issue Context", bytes(ws.linkedIssuesMd));
+  }
   if (nonEmpty(ws.prThreadMd)) {
     // pr-thread.md carries its own trust-framed header and is empty when no
     // comment survives filtering: hide the section entirely.
@@ -339,11 +346,6 @@ export function buildReviewCorpus(
     // human-reviews.md carries its own trust-framed header and is empty
     // when no outstanding human change request fits: same gate.
     pushSection(undefined, bytes(ws.humanReviewsMd));
-  }
-  if (nonEmpty(ws.linkedIssuesMd)) {
-    // context.sh leaves linked-issues.md empty when there's no linked issue
-    // so the model sees no section boundary to react to.
-    pushSection("# Linked Issue Context", bytes(ws.linkedIssuesMd));
   }
   if (opts.ciChecksFile !== "" && nonEmpty(ws.ciChecksContent)) {
     // Exact-head external checks are authoritative evidence: ahead of the

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { runReview } from "../src/run/review.js";
+import { authoritativeBodyRevision, type PrBodyRevision } from "../src/run/stages.js";
 import { forkGate } from "../src/gates/gates.js";
 import { startMockServer } from "./helpers.js";
 import type { PlatformReadAdapter } from "../src/platform/types.js";
@@ -1123,4 +1124,296 @@ test("a PR whose body keyword-links a fetched issue classifies without crashing"
     await server.close();
     cleanup();
   }
+});
+
+test("#812: unresolved bot threads re-emit with their original severity and Minor/Info alone approves", async () => {
+  // The #814 shape: 10 unresolved bot-managed threads, 9 Minor/Info + 1 Major
+  // the model resolved with code-citing evidence. The re-emitted findings must
+  // carry the severity parsed from each managed finding comment, and the strict
+  // verdict over the still-open set (Minor/Info only) must stay an approve.
+  const server = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict({
+      thread_dispositions: [
+        { thread_id: "PRRT_major", disposition: "fixed", evidence: "added tests/fixtures/parity/corpus/v1.json:1" },
+      ],
+    })));
+  });
+  const { runDir, cleanup } = withRunDir();
+  try {
+    const platform = mockPlatform();
+    const botThread = (id: string, label: string, message: string) => ({
+      thread_id: id,
+      path: "src/a.ts",
+      line: 1,
+      original_line: null,
+      resolved: false,
+      outdated: false,
+      comments: [{
+        id, user: "reviewer-bot", created_at: "2026-09-28T10:00:00Z", updated_at: "",
+        body: `**${label}:** ${message}\n\n_Automated finding from AI PR review._`,
+      }],
+    });
+    platform.listReviewThreads = () => Promise.resolve({
+      ok: true,
+      data: [
+        ...[1, 2, 3, 4].map((n) => botThread(`PRRT_t${n}`, "Minor (tests)", `nit ${n}`)),
+        ...[5, 6, 7, 8, 9].map((n) => botThread(`PRRT_t${n}`, "Info (security)", `note ${n}`)),
+        botThread("PRRT_major", "⚠️ Major (tests)", "parity fixture missing"),
+      ],
+    }) as never;
+    const result = await runReview({
+      env: { GITHUB_OUTPUT: join(runDir, "gh-output.txt") },
+      inputs: {
+        "github-token": "tok",
+        repo: "o/r",
+        "pr-number": "7",
+        "ai-base-url": server.url,
+        "ai-model": "m",
+        "ai-stream": "false",
+        "ai-api-key": "k",
+        "ci-status-check": "false",
+      },
+      runDir,
+      workspace: runDir,
+      platformAdapter: platform,
+      persistArtifacts: true,
+      quiet: true,
+    });
+    assert.equal(result.outputs.verdict, "approve");
+    assert.match(result.marker, /review_result.{0,4}findings/);
+    const out = JSON.parse(readFileSync(join(runDir, "ai-output.json"), "utf8")) as Record<string, unknown>;
+    const reemitted = (out.findings as Array<Record<string, unknown>>).filter((f) => f.thread_id);
+    assert.equal(reemitted.length, 9, "every unresolved thread re-emits exactly once");
+    assert.deepEqual(
+      reemitted.map((f) => f.severity).sort(),
+      ["info", "info", "info", "info", "info", "minor", "minor", "minor", "minor"],
+      "each re-emitted finding carries its thread's original severity",
+    );
+    const rows = out.thread_dispositions as Array<Record<string, unknown>>;
+    assert.equal(rows.length, 10);
+    assert.equal(rows.filter((r) => r.disposition === "fixed").length, 1, "the evidenced major resolution is honored");
+    assert.equal(rows.filter((r) => r.enforced === "no disposition given").length, 9);
+    assert.match(String(out.review_markdown), /## Unresolved Review Threads/);
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test("#812: a superseded thread claim is labeled and the authoritative sections come first", async () => {
+  // The #814 shape: an old thread comment says "do not merge until X" while
+  // the current PR body and the linked issue say X happens after merge. The
+  // corpus must order the authoritative sections (PR body, linked issues)
+  // ahead of the discussion, label the pre-edit comment as superseded, and
+  // the system prompt must carry the matching rule.
+  const staleRestBody = "STALE-A: the body the ordinary PR read returned.";
+  const platform = mockPlatform({ body: staleRestBody });
+  const base = platform.getPr.bind(platform);
+  // `updated_at` moved to 12:00 (generic activity); the label must follow the
+  // atomic body snapshot, whose edit at 10:00 postdates the 08:00 comment.
+  // The snapshot's body B differs from the REST body A: whichever body the
+  // cutoff describes is the one the corpus must present.
+  platform.getPr = async () => ({ ...(await base() as Record<string, unknown>), updated_at: "2026-09-28T12:00:00Z" }) as never;
+  const revisionBody = "Closes #12.\n\nShadow qualification happens after merge.";
+  platform.getPrBodyRevision = () => Promise.resolve({ body: revisionBody, editedAt: "2026-09-28T10:00:00Z" });
+  platform.listPrConversationComments = () => Promise.resolve({
+    ok: true,
+    data: [{
+      id: 1,
+      user: { login: "author" },
+      created_at: "2026-09-28T08:00:00Z",
+      updated_at: "",
+      body: "Do not merge until shadow qualification completes.",
+    }],
+  }) as never;
+  platform.getIssue = async () => ({
+    ok: true,
+    data: {
+      number: 12,
+      title: "sequencing",
+      state: "open",
+      html_url: "https://forge.example/o/r/issues/12",
+      labels: [],
+      body: "The qualification runs after merge.",
+    },
+  }) as never;
+  const server = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict()));
+  });
+  const { runDir, cleanup } = withRunDir();
+  try {
+    const result = await runReview({
+      env: { GITHUB_OUTPUT: join(runDir, "gh-output.txt") },
+      inputs: {
+        "github-token": "tok",
+        repo: "o/r",
+        "pr-number": "7",
+        "ai-base-url": server.url,
+        "ai-model": "m",
+        "ai-stream": "false",
+        "ai-api-key": "k",
+        "ci-status-check": "false",
+      },
+      runDir,
+      workspace: runDir,
+      platformAdapter: platform,
+      persistArtifacts: true,
+      quiet: true,
+    });
+    assert.equal(result.outputs.verdict, "approve");
+    // The pre-edit comment is labeled superseded; the section carries the
+    // authoritative-context note.
+    const prThread = readFileSync(join(runDir, "pr-thread.md"), "utf8");
+    assert.match(prThread, /## Comment by author — 2026-09-28T08:00:00Z — earlier discussion \(may be superseded by the current description\)/);
+    assert.match(prThread, /The current PR description and any linked issues are authoritative/);
+    // The corpus presents the authoritative sections before the discussion.
+    const corpus = readFileSync(join(runDir, "review-corpus.truncated.md"), "utf8");
+    const linkedAt = corpus.indexOf("# Linked Issue Context");
+    const threadAt = corpus.indexOf("# PR Thread Context");
+    assert.ok(linkedAt >= 0, "the linked issue reached the corpus");
+    assert.ok(linkedAt < threadAt, "linked issues precede the PR conversation");
+    const metadataAt = corpus.indexOf("# PR Metadata");
+    assert.ok(metadataAt >= 0 && metadataAt < linkedAt);
+    // Atomicity: the presented body is the revision the cutoff describes.
+    assert.ok(corpus.includes("Shadow qualification happens after merge."), "the snapshot body is the authoritative description");
+    assert.ok(!corpus.includes("STALE-A"), "the stale REST body is never presented beside the snapshot cutoff");
+    // The system prompt carries the superseded-discussion rule.
+    const request = readFileSync(join(runDir, "ai-request.primary.json"), "utf8");
+    assert.match(request, /authoritative context and outrank the discussion sections/);
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test("#812 review: generic PR activity without a description edit never softens a comment", async () => {
+  // A blocking comment at 08:00; a push moved updated_at to 12:00. Without a
+  // body-edit instant (no seam method, as on backends without one) — or with
+  // a body edit that OLDER than the claim — the cutoff must stay null/older
+  // and the comment must NOT be labeled superseded.
+  const server = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict()));
+  });
+  const { runDir, cleanup } = withRunDir();
+  try {
+    for (const shape of ["no-revision-seam", "edit-older-than-comment"] as const) {
+      const platform = mockPlatform({ body: "No description edit after the comment." });
+      const base = platform.getPr.bind(platform);
+      platform.getPr = async () => ({ ...(await base() as Record<string, unknown>), updated_at: "2026-09-28T12:00:00Z" }) as never;
+      if (shape === "edit-older-than-comment") {
+        platform.getPrBodyRevision = () => Promise.resolve({ body: "No description edit after the comment.", editedAt: "2026-09-28T07:00:00Z" });
+      }
+      platform.listPrConversationComments = () => Promise.resolve({
+        ok: true,
+        data: [{
+          id: 1,
+          user: { login: "reviewer" },
+          created_at: "2026-09-28T08:00:00Z",
+          updated_at: "",
+          body: "Do not merge until X is fixed.",
+        }],
+      }) as never;
+      await runReview({
+        env: { GITHUB_OUTPUT: join(runDir, `gh-output-${shape}.txt`) },
+        inputs: {
+          "github-token": "tok",
+          repo: "o/r",
+          "pr-number": "7",
+          "ai-base-url": server.url,
+          "ai-model": "m",
+          "ai-stream": "false",
+          "ai-api-key": "k",
+          "ci-status-check": "false",
+        },
+        runDir,
+        workspace: runDir,
+        platformAdapter: platform,
+        persistArtifacts: true,
+        quiet: true,
+      });
+      const prThread = readFileSync(join(runDir, "pr-thread.md"), "utf8");
+      assert.ok(prThread.includes("Do not merge until X is fixed."), shape);
+      assert.ok(!prThread.includes("earlier discussion"), `comment must not be softened (${shape})`);
+      assert.ok(!prThread.includes("authoritative"), `no label, no authoritative note (${shape})`);
+      rmSync(join(runDir, "pr-thread.md"));
+    }
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test("#812 review: discussion appearing during the CI wait reapplies the superseded-discussion rule", async () => {
+  const requests: string[] = [];
+  const server = await startMockServer((_req, body, res) => {
+    requests.push(String(body));
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict()));
+  });
+  // Deterministic timing: the FIRST fetch (initial context stage) sees no
+  // comments; every later fetch (the post-CI rebuild) sees the one that
+  // landed while CI ran — independent of when the gate workload runs.
+  let commentsFetch = 0;
+  const platform = mockPlatform();
+  platform.listPrConversationComments = () => {
+    commentsFetch += 1;
+    return Promise.resolve({
+      ok: true,
+      data: commentsFetch >= 2
+        ? [{ id: 1, user: { login: "reviewer" }, created_at: "2026-09-28T08:00:00Z", updated_at: "", body: "A blocking claim appears while CI runs." }]
+        : [],
+    }) as never;
+  };
+  const { runDir, cleanup } = withRunDir();
+  try {
+    await runReview({
+      env: { GITHUB_OUTPUT: join(runDir, "gh-output.txt") },
+      inputs: {
+        "github-token": "tok",
+        repo: "o/r",
+        "pr-number": "7",
+        "ai-base-url": server.url,
+        "ai-model": "m",
+        "ai-stream": "false",
+        "ai-api-key": "k",
+        "ci-status-check": "true",
+      },
+      runDir,
+      workspace: runDir,
+      platformAdapter: platform,
+      // The gate runs to completion, so the post-CI metadata refresh fires.
+      ciGate: { file: "", envAllowlist: [], workload: async () => 0 },
+      persistArtifacts: true,
+      quiet: true,
+    });
+    // The rebuilt pr-thread section carries the late comment...
+    const prThread = readFileSync(join(runDir, "pr-thread.md"), "utf8");
+    assert.match(prThread, /A blocking claim appears while CI runs\./);
+    // ...and the system prompt sent to the model carries the rule.
+    const request = readFileSync(join(runDir, "ai-request.primary.json"), "utf8");
+    assert.match(request, /authoritative context and outrank the discussion sections/);
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test("#812 review: authoritativeBodyRevision normalizes the snapshot and fails safe", async () => {
+  const adapter = (revision: unknown, method = true): PlatformReadAdapter =>
+    ({ ...(method ? { getPrBodyRevision: () => Promise.resolve(revision as PrBodyRevision | null) } : {}) } as unknown as PlatformReadAdapter);
+  // A usable snapshot passes through with a normalized editedAt.
+  assert.deepEqual(await authoritativeBodyRevision(adapter({ body: "B", editedAt: "2026-09-28T10:00:00Z" })), { body: "B", editedAt: "2026-09-28T10:00:00Z" });
+  assert.deepEqual(await authoritativeBodyRevision(adapter({ body: "B", editedAt: "" })), { body: "B", editedAt: null });
+  // No seam (backend without it), an explicit null, a malformed payload, a
+  // body that is not a string, and a throwing read all yield null: the REST
+  // body is presented and nothing is softened.
+  assert.equal(await authoritativeBodyRevision(adapter(null, false)), null);
+  assert.equal(await authoritativeBodyRevision(adapter(null)), null);
+  assert.equal(await authoritativeBodyRevision(adapter("nope")), null);
+  assert.equal(await authoritativeBodyRevision(adapter({ editedAt: "2026-09-28T10:00:00Z" })), null);
+  const throwing: PlatformReadAdapter = { getPrBodyRevision: () => Promise.reject(new Error("down")) } as unknown as PlatformReadAdapter;
+  assert.equal(await authoritativeBodyRevision(throwing), null);
 });

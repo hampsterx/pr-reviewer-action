@@ -85,6 +85,15 @@ export interface PlatformReadAdapter extends PlatformAdapter {
   /** `platform_review_threads`: up to 100 inline review threads in the
    * review_threads.py shape. */
   listReviewThreads(): Promise<ReadResult<unknown[]>>;
+  /** #812: the PR body and the instant of its latest edit as ONE atomic
+   * snapshot — on GitHub both fields come from the same GraphQL document
+   * (`body`, `lastEditedAt`; the latter never moves on pushes, comments or
+   * label changes, and is null when the body was never edited). The body is
+   * the authoritative description the corpus presents, and `editedAt` is the
+   * only cutoff the discussion renderers of that pass may label with.
+   * Backends without such a snapshot do not implement this method: the
+   * REST-fetched body is presented and nothing is softened. Never throws. */
+  getPrBodyRevision?(): Promise<{ body: string; editedAt: string | null } | null>;
   /** `platform_pr_reviews ... paginate`: every review, the shape
    * human_reviews.py consumes. */
   listPrReviewsPaginated(): Promise<ReadResult<unknown[]>>;

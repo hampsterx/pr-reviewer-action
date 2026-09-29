@@ -485,6 +485,50 @@ carry-forward it lived in was removed with #619, and the thread-settlement
 path already prunes `fixed` threads from the open findings (pinned by
 regression tests).
 
+### The #812 thread-severity and superseded-discussion change
+
+Two consistency fixes complete #812 (the CI-aware skip and the post-CI
+metadata refresh above were the first half):
+
+- **Thread settlement runs, and re-emission keeps the original severity.**
+  The v3 pipeline used to read `review-threads.json` /
+  `human-reviews.json` with an object-only reader, so the #770/#774
+  settlements never received their input and never ran. They run now. A
+  re-emitted finding carries the thread's original severity — the severity
+  the enforcement view parsed from the managed finding comment the bot
+  posted (`**Minor (tests):**`, `**⚠️ Major:**`, `**🛑 Blocker …**`) —
+  defaulting to minor when it cannot be determined and never escalating.
+  Under `strict`, Minor/Info-only re-emissions therefore leave an approve
+  standing (`review_result: findings`); only still-open major/blocker
+  threads can drive `request_changes`. Under
+  `findings_severity_gated` the settlement's blocker escalation is
+  unchanged (v2 parity).
+- **Current PR metadata outranks earlier discussion.** The corpus places
+  `# Linked Issue Context` before every discussion section (PR
+  conversation, review threads, human reviews), immediately after the PR
+  metadata that carries the body. Each metadata pass consumes ONE atomic
+  body snapshot from the platform seam's optional `getPrBodyRevision`: on
+  GitHub a single GraphQL document carries `body` and `lastEditedAt` (the
+  body's own edit instant — it moves only on description edits, is null
+  when the body was never edited; the REST `updated_at` moves on every
+  push or comment and is deliberately NOT used). The snapshot's body is
+  the authoritative description the corpus presents, and the same
+  `editedAt` is the only cutoff both discussion renderers of that pass
+  label with: comments older than it read "earlier discussion (may be
+  superseded by the current description)" and the section header states
+  that the current description and linked issues are authoritative. A
+  backend without the snapshot seam — or a failed or malformed read —
+  presents the REST-fetched body and labels nothing: a cutoff is never
+  paired with a body it does not describe, so generic activity can never
+  make a blocking claim look superseded. A v3-only prompt rule tells the
+  reviewer that a claim in earlier discussion which the current
+  description or a linked issue overrides is not a blocker; the rule is
+  (idempotently) reapplied after the post-CI metadata refresh, which
+  fetches a fresh atomic snapshot the same way, so discussion that
+  appeared while CI ran is covered too. The snapshot and the rule are
+  consumed only by the v3 run pipeline, so the v2-shared rendering and
+  every parity boundary stay byte-identical.
+
 ### The `conversation-rendering` boundary (#678)
 
 Pins the v3 `Conversation` port (`src/model/conversation.ts`) against

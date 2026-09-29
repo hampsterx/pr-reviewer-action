@@ -3,6 +3,7 @@ import { validateEndpoint, type EndpointValidation } from "./endpoint.js";
 import { PlatformRequestError, requestJson, requestText, type FetchLike } from "./http.js";
 import {
   GITHUB_CONVERSATION_COMMENTS_QUERY,
+  GITHUB_PR_BODY_REVISION_QUERY,
   GITHUB_REVIEW_THREADS_QUERY,
   normalizeExternalChecks,
   normalizeGithubConversationComments,
@@ -196,6 +197,27 @@ export class GitHubAdapter implements PlatformReadAdapter {
       return status === 200 ? text : "";
     } catch {
       return "";
+    }
+  }
+
+  /** #812: the PR body and its last-edit instant from ONE GraphQL document.
+   * A failed or unusable read returns null — the REST body is then
+   * presented and nothing is softened; a cutoff is never paired with a body
+   * it does not describe. */
+  async getPrBodyRevision(): Promise<{ body: string; editedAt: string | null } | null> {
+    const response = await this.graphql(GITHUB_PR_BODY_REVISION_QUERY);
+    if (!response.ok) return null;
+    try {
+      const data = response.data as { data?: { repository?: { pullRequest?: { body?: unknown; lastEditedAt?: unknown } } } | null } | null;
+      const pullRequest = data?.data?.repository?.pullRequest;
+      if (pullRequest === null || pullRequest === undefined || typeof pullRequest.body !== "string") return null;
+      const editedAt = pullRequest.lastEditedAt;
+      return {
+        body: pullRequest.body,
+        editedAt: typeof editedAt === "string" && editedAt !== "" ? editedAt : null,
+      };
+    } catch {
+      return null;
     }
   }
 

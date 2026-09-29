@@ -111,3 +111,27 @@ test("the custom marker is a plain substring filter", () => {
   ];
   assert.deepEqual(filterComments(prepareComments(comments), "MANAGED-BOT").map((c) => c.id), []);
 });
+
+test("#812: comments older than the PR's last edit are labeled superseded; fresh ones are not", () => {
+  const comments = [
+    { id: 1, user: "alice", created_at: "2026-09-28T08:00:00Z", updated_at: "", body: "do not merge until X" },
+    { id: 2, user: "bob", created_at: "2026-09-28T12:00:00Z", updated_at: "", body: "posted after the edit" },
+  ];
+  const cutoff = "2026-09-28T10:00:00Z";
+  const labeled = renderPrThread(comments, undefined, undefined, 50000, cutoff);
+  assert.match(labeled, /## Comment by alice — 2026-09-28T08:00:00Z — earlier discussion \(may be superseded by the current description\)/);
+  assert.ok(!labeled.includes("## Comment by bob — 2026-09-28T12:00:00Z — earlier"));
+  assert.match(labeled, /The current PR description and any linked issues are authoritative/);
+  // Fresh comments only: no label, no authoritative note.
+  const fresh = renderPrThread([comments[1]!], undefined, undefined, 50000, cutoff);
+  assert.ok(!fresh.includes("earlier discussion"));
+  assert.ok(!fresh.includes("authoritative"));
+  // Without a cutoff (the v2/parity path) the rendering is unlabeled.
+  const plain = renderPrThread(comments, undefined, undefined, 50000);
+  assert.ok(!plain.includes("earlier discussion"));
+  assert.ok(!plain.includes("authoritative"));
+  // Unorderable stamps are never marked: bad cutoff or bad comment stamp.
+  assert.ok(!renderPrThread(comments, undefined, undefined, 50000, "not-a-date").includes("earlier discussion"));
+  const badStamp = [{ id: 3, user: "carol", created_at: "garbage", updated_at: "", body: "x" }];
+  assert.ok(!renderPrThread(badStamp, undefined, undefined, 50000, cutoff).includes("earlier discussion"));
+});

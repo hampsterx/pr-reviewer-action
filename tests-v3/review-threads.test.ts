@@ -83,3 +83,20 @@ test("enforcement view parses severity and message from the finding body", () =>
     { thread_id: "H", path: "a.py", line: 4, severity: "minor", message: "Should this handle None?", own_finding: false, replies: 0 },
   ]);
 });
+
+test("#812: thread comments older than the PR's last edit are labeled superseded", () => {
+  const raw = [thread("PRRT_1", [
+    comment(1, "reviewer-bot", "2026-09-28T08:00:00Z", "**🛑 Blocker (bug):** do not merge until X\n\n" + FINDING_TRAILER),
+    comment(2, "alice", "2026-09-28T12:00:00Z", "posted after the edit"),
+  ])];
+  const threads = prepareThreads(raw);
+  const cutoff = "2026-09-28T10:00:00Z";
+  const [labeled] = renderReviewThreads(threads, undefined, 50000, cutoff);
+  assert.match(labeled, /### Finding \(this reviewer\) — 2026-09-28T08:00:00Z — earlier discussion \(may be superseded by the current description\)/);
+  assert.ok(!labeled.includes("### Reply by alice — 2026-09-28T12:00:00Z — earlier"));
+  assert.match(labeled, /The current PR description and any linked issues are authoritative/);
+  // Without a cutoff (the v2/parity path) the rendering is unlabeled.
+  const [plain] = renderReviewThreads(threads, undefined, 50000);
+  assert.ok(!plain.includes("earlier discussion"));
+  assert.ok(!plain.includes("authoritative"));
+});

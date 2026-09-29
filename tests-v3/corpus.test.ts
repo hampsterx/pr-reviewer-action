@@ -300,6 +300,26 @@ const baseOptions = {
   budgetGuard: false,
 };
 
+test("#812: the PR body and linked issues precede every discussion section (authoritative first)", () => {
+  const ws = {
+    ...baseWorkspace(),
+    linkedIssuesMd: enc("#1 states the qualification runs after merge.\n"),
+    prThreadMd: enc("# PR Thread Context\nold thread claims a gate\n"),
+    reviewThreadsMd: enc("# Unresolved Review Threads\nthread text\n"),
+    humanReviewsMd: null,
+  };
+  const result = buildReviewCorpus(ws, baseOptions);
+  const corpus = dec(result.artifacts.get("review-corpus.md")!);
+  const metadataAt = corpus.indexOf("# PR Metadata");
+  const linkedAt = corpus.indexOf("# Linked Issue Context");
+  const threadAt = corpus.indexOf("# PR Thread Context");
+  const reviewThreadsAt = corpus.indexOf("# Unresolved Review Threads");
+  assert.ok(metadataAt >= 0);
+  assert.ok(linkedAt > metadataAt, "linked issues follow the PR metadata that carries the body");
+  assert.ok(linkedAt < threadAt, "linked issues precede the PR conversation");
+  assert.ok(linkedAt < reviewThreadsAt, "linked issues precede the unresolved review threads");
+});
+
 test("section order and authority: standards first, ledger after the body, leads last", () => {
   const ws = {
     ...baseWorkspace(),

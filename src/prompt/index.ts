@@ -9,6 +9,8 @@ export {
   PROMPT_PRESENCE_FILES,
   SystemPromptFileError,
   applySpecialistLeadsFragment,
+  applySupersededDiscussionFragment,
+  SUPERSEDED_DISCUSSION_GUIDANCE,
   applySystemPromptFragments,
   resolveSystemPrompt,
   type FragmentDials,

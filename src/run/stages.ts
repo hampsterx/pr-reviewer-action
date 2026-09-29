@@ -58,6 +58,21 @@ export function safeJson(bytes: Uint8Array | null | undefined): Record<string, u
   }
 }
 
+/** Array-valued companion to `safeJson`: the enforcement views
+ * (`review-threads.json`, `human-reviews.json`) are JSON arrays, and the
+ * object-only reader above nulls them — which silently disabled the #680
+ * settlements in the v3 pipeline (#812). Null/absent/undecodable reads
+ * return null, exactly like `safeJson`. */
+export function safeJsonArray(bytes: Uint8Array | null | undefined): unknown[] | null {
+  if (bytes === null || bytes === undefined || bytes.length === 0) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
+    return Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 function joinLines(lines: readonly string[]): string {
   return lines.length > 0 ? `${lines.join("\n")}\n` : "";
 }
@@ -158,7 +173,7 @@ export async function generatedAttributePaths(workspace: string, diffText: strin
 // context.sh: review threads + human reviews sections
 // ---------------------------------------------------------------------------
 
-export async function buildReviewThreadsSection(ws: RunWorkspace, adapter: PlatformReadAdapter, env: StageEnv): Promise<void> {
+export async function buildReviewThreadsSection(ws: RunWorkspace, adapter: PlatformReadAdapter, env: StageEnv, supersededCutoff: string | null): Promise<void> {
   ws.write("review-threads.raw.json", "");
   ws.write("review-threads.md", "");
   ws.write("review-threads.json", "");
@@ -171,7 +186,7 @@ export async function buildReviewThreadsSection(ws: RunWorkspace, adapter: Platf
   ws.write("review-threads.raw.json", pyJsonDumps(fetched.data));
   try {
     const threads = prepareThreads(fetched.data);
-    const [markdown, rendered] = renderReviewThreads(threads, undefined, maxBytes);
+    const [markdown, rendered] = renderReviewThreads(threads, undefined, maxBytes, supersededCutoff);
     ws.write("review-threads.md", markdown);
     ws.write("review-threads.json", rendered.length > 0 ? `${pythonJsonStringify(threadEnforcementView(rendered))}\n` : "");
     ws.write("review-threads-present.txt", rendered.length > 0 ? `${rendered.length}\n` : "");
@@ -327,7 +342,7 @@ export async function buildRelatedCodeSection(ws: RunWorkspace, env: StageEnv, w
   }
 }
 
-export async function buildPrThreadSection(ws: RunWorkspace, adapter: PlatformReadAdapter, env: StageEnv): Promise<void> {
+export async function buildPrThreadSection(ws: RunWorkspace, adapter: PlatformReadAdapter, env: StageEnv, supersededCutoff: string | null): Promise<void> {
   ws.write("pr-thread.json", "");
   ws.write("pr-thread.md", "");
   if ((env.PR_THREAD_CONTEXT ?? "true").toLowerCase() !== "true") return;
@@ -335,10 +350,35 @@ export async function buildPrThreadSection(ws: RunWorkspace, adapter: PlatformRe
   if (!fetched.ok) return;
   ws.write("pr-thread.json", pyJsonDumps(fetched.data));
   try {
-    const markdown = renderPrThread(fetched.data, undefined, undefined, Number(env.PR_THREAD_MAX_BYTES ?? "8000") || 8000);
+    const markdown = renderPrThread(fetched.data, undefined, undefined, Number(env.PR_THREAD_MAX_BYTES ?? "8000") || 8000, supersededCutoff);
     ws.write("pr-thread.md", markdown);
   } catch {
     ws.write("pr-thread.md", "");
+  }
+}
+
+/** The atomic body snapshot the #812 metadata pass consumes: the body the
+ * corpus presents as the authoritative description, and the one cutoff its
+ * discussion renderers may label with. */
+export interface PrBodyRevision {
+  body: string;
+  editedAt: string | null;
+}
+
+/** #812: the platform's atomic body snapshot (`getPrBodyRevision`; on
+ * GitHub one GraphQL document carries `body` and `lastEditedAt`). Null when
+ * the backend does not provide the seam, the read fails, or the payload is
+ * malformed — the REST-fetched body is then presented and the discussion
+ * renderers label nothing: a cutoff is never paired with a body it does
+ * not describe. */
+export async function authoritativeBodyRevision(adapter: PlatformReadAdapter): Promise<PrBodyRevision | null> {
+  try {
+    const revision = await adapter.getPrBodyRevision?.();
+    if (revision === null || revision === undefined || typeof revision.body !== "string") return null;
+    const editedAt = typeof revision.editedAt === "string" && revision.editedAt !== "" ? revision.editedAt : null;
+    return { body: revision.body, editedAt };
+  } catch {
+    return null;
   }
 }
 

@@ -9,11 +9,30 @@
  * `open`. Every `open`/`disputed` thread is re-emitted as a finding carrying
  * `thread_id` (the publish step skips those inline — the thread already
  * exists). Under `findings_severity_gated` a re-emitted blocker escalates
- * the verdict like any other blocker.
+ * the verdict like any other blocker; under `strict` (#811) the settlement
+ * never forces a verdict — the strict mapping alone derives one from the
+ * final still-open findings set.
+ *
+ * #812: the re-emitted finding carries the thread's ORIGINAL severity —
+ * the severity the context stage parsed from the managed finding comment
+ * the bot posted (`**Minor (tests):** …` / `**⚠️ Major:** …` /
+ * `**🛑 Blocker …**`). A severity that cannot be determined (missing or
+ * outside the finding vocabulary) defaults to minor, and re-emission never
+ * escalates: Minor/Info-only re-emissions must leave an approve standing.
  */
 import type { ArtifactFinding, ReviewArtifact } from "./artifact.js";
 
 export const THREAD_DISPOSITIONS: readonly string[] = ["fixed", "open", "disputed"];
+
+/** The finding severities re-emission may carry; anything else is
+ * undeterminable and defaults to minor (#812). */
+const FINDING_SEVERITIES: ReadonlySet<string> = new Set(["blocker", "major", "minor", "info"]);
+
+function reemittedSeverity(raw: unknown): ArtifactFinding["severity"] {
+  return typeof raw === "string" && FINDING_SEVERITIES.has(raw)
+    ? (raw as ArtifactFinding["severity"])
+    : "minor";
+}
 
 /**
  * Evidence that cites code: a path-shaped token with an extension (optionally
@@ -53,9 +72,9 @@ export interface ThreadEnforcementResult {
  * Mirrors v2 exactly: the first disposition for a thread_id wins; unknown or
  * missing dispositions downgrade to `open`; `fixed` needs evidence citing
  * current code; open/disputed threads are re-emitted as findings with the
- * thread's severity (default minor) unless a finding already carries the
- * thread_id; the settled records replace `thread_dispositions` in the
- * artifact.
+ * thread's original severity (default minor, never escalating, #812) unless
+ * a finding already carries the thread_id; the settled records replace
+ * `thread_dispositions` in the artifact.
  */
 export function applyReviewThreadEnforcement(
   artifact: ReviewArtifact,
@@ -102,7 +121,7 @@ export function applyReviewThreadEnforcement(
     settled.push(record);
     if (disposition !== "fixed" && !knownThreadIds.has(threadId)) {
       const finding: ArtifactFinding = {
-        severity: (thread.severity as ArtifactFinding["severity"]) || "minor",
+        severity: reemittedSeverity(thread.severity),
         category: "other",
         file: thread.path,
         line: thread.line,
