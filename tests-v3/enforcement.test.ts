@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ParsedReviewVerdict } from "../src/model/types.js";
 import { reviewArtifactFromParsed, type ReviewArtifact } from "../src/enforcement/artifact.js";
-import { applyVerdictPolicy, parseNonBlockingCategories, securityRiskFlagged } from "../src/enforcement/verdict-policy.js";
+import { applyVerdictPolicy, applyStrictVerdictPolicy, parseNonBlockingCategories, securityRiskFlagged } from "../src/enforcement/verdict-policy.js";
+import { enforcementView, prepareThreads, renderReviewThreads } from "../src/context/review-threads.js";
 import { applyRequiredCheckValidation, CHECK_CONCEPTS, validateReview } from "../src/enforcement/completeness.js";
 import { applyReviewThreadEnforcement, evidenceCitesCode } from "../src/enforcement/threads.js";
 import { applyHumanReviewEnforcement, inlineCode } from "../src/enforcement/human-reviews.js";
@@ -357,6 +358,65 @@ test("#792: the same blocker claimed fixed WITHOUT code evidence stays open and 
   const reemitted = a.findings[0] as unknown as { severity: string; thread_id?: string };
   assert.equal(reemitted.severity, "blocker");
   assert.equal(reemitted.thread_id, "t1");
+});
+
+test("#812: the #814 shape — nine Minor/Info threads plus one Major resolved with evidence — never requests changes", () => {
+  // Thread roots exactly as the publish step's managed finding comments are
+  // posted: the enforcement view parses the ORIGINAL severity from each.
+  const botThread = (id: string, label: string, message: string) => ({
+    thread_id: id,
+    path: "src/a.ts",
+    line: 1,
+    comments: [{
+      id, user: "reviewer-bot", created_at: "2026-09-28T10:00:00Z",
+      body: `**${label}:** ${message}\n\n_Automated finding from AI PR review._`,
+    }],
+  });
+  const raw = [
+    ...[1, 2, 3, 4].map((n) => botThread(`PRRT_t${n}`, "Minor (tests)", `nit ${n}`)),
+    ...[5, 6, 7, 8, 9].map((n) => botThread(`PRRT_t${n}`, "Info (security)", `note ${n}`)),
+    botThread("PRRT_major", "⚠️ Major (tests)", "parity fixture missing"),
+  ];
+  const view = enforcementView(renderReviewThreads(prepareThreads(raw))[1]);
+  assert.deepEqual(
+    [...view.map((v) => v.severity)].sort(),
+    ["info", "info", "info", "info", "info", "major", "minor", "minor", "minor", "minor"],
+  );
+
+  const a = artifact({
+    verdict: "approve",
+    thread_dispositions: [
+      { thread_id: "PRRT_major", disposition: "fixed", evidence: "added tests/fixtures/parity/corpus/v1.json:1" },
+    ],
+  });
+  const settlement = applyReviewThreadEnforcement(a, view, "strict");
+  assert.equal(settlement.applied, true);
+  assert.equal(settlement.reason, "review threads: 9 disposition(s) downgraded, 9 finding(s) re-emitted");
+  assert.deepEqual(
+    (a.findings as Array<{ severity: string }>).map((f) => f.severity).sort(),
+    ["info", "info", "info", "info", "info", "minor", "minor", "minor", "minor"],
+    "each re-emitted finding carries its thread's original severity",
+  );
+  // Strict mapping over the final still-open set: Minor/Info alone approves.
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "approve", forced: false });
+  assert.equal(a.verdict, "approve");
+  assert.equal(outcome.reviewResult, "findings");
+  assert.equal(outcome.overridden, false);
+});
+
+test("#812: an undeterminable re-emission severity defaults to minor and never blocks", () => {
+  const a = artifact({ thread_dispositions: [] });
+  applyReviewThreadEnforcement(a, [
+    { thread_id: "g1", path: "a.py", line: 1, severity: "critical", message: "x", own_finding: true, replies: 0 },
+    { thread_id: "g2", path: "a.py", line: 2, severity: "", message: "y", own_finding: true, replies: 0 },
+    { thread_id: "g3", path: "a.py", line: 3, severity: "Major", message: "z", own_finding: true, replies: 0 },
+  ], "strict");
+  assert.deepEqual(
+    (a.findings as Array<{ severity: string }>).map((f) => f.severity),
+    ["minor", "minor", "minor"],
+  );
+  applyStrictVerdictPolicy(a, { modelVerdict: "approve", forced: false });
+  assert.equal(a.verdict, "approve");
 });
 
 // ---------------------------------------------------------------------------

@@ -1124,3 +1124,78 @@ test("a PR whose body keyword-links a fetched issue classifies without crashing"
     cleanup();
   }
 });
+
+test("#812: unresolved bot threads re-emit with their original severity and Minor/Info alone approves", async () => {
+  // The #814 shape: 10 unresolved bot-managed threads, 9 Minor/Info + 1 Major
+  // the model resolved with code-citing evidence. The re-emitted findings must
+  // carry the severity parsed from each managed finding comment, and the strict
+  // verdict over the still-open set (Minor/Info only) must stay an approve.
+  const server = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict({
+      thread_dispositions: [
+        { thread_id: "PRRT_major", disposition: "fixed", evidence: "added tests/fixtures/parity/corpus/v1.json:1" },
+      ],
+    })));
+  });
+  const { runDir, cleanup } = withRunDir();
+  try {
+    const platform = mockPlatform();
+    const botThread = (id: string, label: string, message: string) => ({
+      thread_id: id,
+      path: "src/a.ts",
+      line: 1,
+      original_line: null,
+      resolved: false,
+      outdated: false,
+      comments: [{
+        id, user: "reviewer-bot", created_at: "2026-09-28T10:00:00Z", updated_at: "",
+        body: `**${label}:** ${message}\n\n_Automated finding from AI PR review._`,
+      }],
+    });
+    platform.listReviewThreads = () => Promise.resolve({
+      ok: true,
+      data: [
+        ...[1, 2, 3, 4].map((n) => botThread(`PRRT_t${n}`, "Minor (tests)", `nit ${n}`)),
+        ...[5, 6, 7, 8, 9].map((n) => botThread(`PRRT_t${n}`, "Info (security)", `note ${n}`)),
+        botThread("PRRT_major", "⚠️ Major (tests)", "parity fixture missing"),
+      ],
+    }) as never;
+    const result = await runReview({
+      env: { GITHUB_OUTPUT: join(runDir, "gh-output.txt") },
+      inputs: {
+        "github-token": "tok",
+        repo: "o/r",
+        "pr-number": "7",
+        "ai-base-url": server.url,
+        "ai-model": "m",
+        "ai-stream": "false",
+        "ai-api-key": "k",
+        "ci-status-check": "false",
+      },
+      runDir,
+      workspace: runDir,
+      platformAdapter: platform,
+      persistArtifacts: true,
+      quiet: true,
+    });
+    assert.equal(result.outputs.verdict, "approve");
+    assert.match(result.marker, /review_result.{0,4}findings/);
+    const out = JSON.parse(readFileSync(join(runDir, "ai-output.json"), "utf8")) as Record<string, unknown>;
+    const reemitted = (out.findings as Array<Record<string, unknown>>).filter((f) => f.thread_id);
+    assert.equal(reemitted.length, 9, "every unresolved thread re-emits exactly once");
+    assert.deepEqual(
+      reemitted.map((f) => f.severity).sort(),
+      ["info", "info", "info", "info", "info", "minor", "minor", "minor", "minor"],
+      "each re-emitted finding carries its thread's original severity",
+    );
+    const rows = out.thread_dispositions as Array<Record<string, unknown>>;
+    assert.equal(rows.length, 10);
+    assert.equal(rows.filter((r) => r.disposition === "fixed").length, 1, "the evidenced major resolution is honored");
+    assert.equal(rows.filter((r) => r.enforced === "no disposition given").length, 9);
+    assert.match(String(out.review_markdown), /## Unresolved Review Threads/);
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});

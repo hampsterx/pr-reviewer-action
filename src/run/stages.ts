@@ -58,6 +58,21 @@ export function safeJson(bytes: Uint8Array | null | undefined): Record<string, u
   }
 }
 
+/** Array-valued companion to `safeJson`: the enforcement views
+ * (`review-threads.json`, `human-reviews.json`) are JSON arrays, and the
+ * object-only reader above nulls them — which silently disabled the #680
+ * settlements in the v3 pipeline (#812). Null/absent/undecodable reads
+ * return null, exactly like `safeJson`. */
+export function safeJsonArray(bytes: Uint8Array | null | undefined): unknown[] | null {
+  if (bytes === null || bytes === undefined || bytes.length === 0) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
+    return Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 function joinLines(lines: readonly string[]): string {
   return lines.length > 0 ? `${lines.join("\n")}\n` : "";
 }

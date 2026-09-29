@@ -75,6 +75,7 @@ import {
   runImageDigestPhase,
   runToolHarnessPhase,
   safeJson,
+  safeJsonArray,
   specialistWorkspace,
 } from "./stages.js";
 import type { ReadResult } from "../platform/types.js";
@@ -671,8 +672,10 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     toolMinSuccessful: Number(env.TOOL_MIN_SUCCESSFUL_REQUESTS ?? "0") || 0,
     evidence: safeJson(ws.read("evidence-providers.json")) as never,
     toolHarness: safeJson(ws.read(enforcementHarness)) as never,
-    threads: safeJson(ws.read("review-threads.json")) as never,
-    humanReviews: safeJson(ws.read("human-reviews.json")) as never,
+    // #812: the settlement views are JSON arrays — the object-only safeJson
+    // nulled them, so review-thread and human-review settlement never ran.
+    threads: safeJsonArray(ws.read("review-threads.json")) as never,
+    humanReviews: safeJsonArray(ws.read("human-reviews.json")) as never,
     verdictPolicy,
   };
   if (verdictPolicy === "strict") {
