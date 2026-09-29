@@ -90,6 +90,26 @@ Four consumer groups keep v2 code alive after the cutover. Everything in
   Port-provenance comments inside `src/` are history, not consumers, and stay.
 - **Wave 1 — delete the (a) set** (v2 production runtime, its tests, and the
   dead CI jobs/steps listed below). The (c) set and the parity harness stay.
+  **LANDED**, with five files held back that the per-file grep showed to have
+  live consumers outside the (a) set — they stay until wave 2 unless their
+  consumers move first: `tests/test_issue_749_path_classification.py`,
+  `tests/test_linked_issue_classification.sh` and
+  `tests/test_precheck_linear_fingerprint.sh` (executed by the kept
+  `scripts/run_semantic_eval_ci.py` dataflow gates), `tests/test_concurrent_gating.sh`
+  (the semantic gate's scenario 6548 greps it as evidence; it runs under
+  `validate-bash` auto-discovery meanwhile), and `scripts/verify_pr_head.sh`
+  + `tests/test_verify_pr_head.sh` (`scripts/publish.sh:25`, (c), executes
+  the script). `scripts/summarize_tool_loop_telemetry.py` WAS deleted: it
+  appeared in both this table and the (c) table and the grep showed zero
+  surviving consumers — the (c) row was an error. `tests/test_corpus_standards_survival.sh`
+  is on disk but absent from every list here — left unclassified, wave-2 doc
+  pass to disposition it. The v2 argv guard (`tests/test_api_key_argv.py`)
+  died with this wave as planned; the durable secret-transport invariant it
+  guarded — model API credentials ride only the provider auth headers, never
+  process argv, request URLs or bodies, or locally generated diagnostics —
+  is pinned normatively in AGENTS.md and by `tests-v3/transport.test.ts`
+  ("the api key rides only the auth headers — never the URL, body, or
+  failure diagnostics"), so no wave-2 follow-up is needed.
 - **Wave 2 — at the #681 release gate.** Freeze or retire each parity
   boundary, then delete the (c) set, the runners, and the remaining
   oracle-only tests. After wave 2 the **shipped action** contains no Bash and
