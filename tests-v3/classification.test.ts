@@ -98,6 +98,25 @@ test("Linear priority only escalates on the integer values 1 and 2", () => {
   assert.deepEqual(github.riskFlags, []);
 });
 
+// The run seam passes buildLinkedIssueContext's raw collection through
+// normalizeLinkedIssues before classifyPr: GitHub refs carry no `source`
+// field and only carry `labels` when their fetch succeeded, and a projected
+// label may have no name. The boundary turns all of that into canonical
+// entries, so the classifier stays behind its canonical typed input.
+
+test("the run seam's raw linked-issue shapes normalize before classification", () => {
+  const result = classifyPr({
+    prFiles: files("src/a.py"),
+    linkedIssues: normalizeLinkedIssues([
+      { ref: "o/r#824", repo: "o/r", number: 824, labels: [{ name: "Security" }, { name: "audit" }] },
+      { ref: "o/r#9", repo: "o/r", number: 9 },
+      { ref: "o/r#10", repo: "o/r", number: 10, labels: [{}] },
+    ]),
+  });
+  assert.deepEqual(result.riskFlags, ["linked_security_issue", "linked_audit_issue"]);
+  assert.deepEqual(result.linkedIssueLabels, ["Security", "audit"]);
+});
+
 test("file-based flags attribute triggering files; diff-only matches attribute an empty list", () => {
   const attributed = classifyPr({ prFiles: files("src/middleware/auth.ts", "readme.md") });
   assert.deepEqual(attributed.riskFlagsWithFiles["auth_changes"], ["src/middleware/auth.ts"]);
