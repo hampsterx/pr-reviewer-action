@@ -485,6 +485,38 @@ carry-forward it lived in was removed with #619, and the thread-settlement
 path already prunes `fixed` threads from the open findings (pinned by
 regression tests).
 
+### The #812 thread-severity and superseded-discussion change
+
+Two consistency fixes complete #812 (the CI-aware skip and the post-CI
+metadata refresh above were the first half):
+
+- **Thread settlement runs, and re-emission keeps the original severity.**
+  The v3 pipeline used to read `review-threads.json` /
+  `human-reviews.json` with an object-only reader, so the #770/#774
+  settlements never received their input and never ran. They run now. A
+  re-emitted finding carries the thread's original severity — the severity
+  the enforcement view parsed from the managed finding comment the bot
+  posted (`**Minor (tests):**`, `**⚠️ Major:**`, `**🛑 Blocker …**`) —
+  defaulting to minor when it cannot be determined and never escalating.
+  Under `strict`, Minor/Info-only re-emissions therefore leave an approve
+  standing (`review_result: findings`); only still-open major/blocker
+  threads can drive `request_changes`. Under
+  `findings_severity_gated` the settlement's blocker escalation is
+  unchanged (v2 parity).
+- **Current PR metadata outranks earlier discussion.** The corpus places
+  `# Linked Issue Context` before every discussion section (PR
+  conversation, review threads, human reviews), immediately after the PR
+  metadata that carries the body. The thread renderers take the PR's
+  last-edit instant (the raw PR object's `updated_at` — the deterministic
+  proxy for the latest description edit) as a superseded cutoff: comments
+  older than it are labeled "earlier discussion (may be superseded by the
+  current description)" and the section header states that the current
+  description and linked issues are authoritative. A v3-only prompt rule
+  tells the reviewer that a claim in earlier discussion which the current
+  description or a linked issue overrides is not a blocker. The cutoff is
+  passed only by the v3 run pipeline (refreshed after the CI wait), so the
+  v2-shared rendering and every parity boundary stay byte-identical.
+
 ### The `conversation-rendering` boundary (#678)
 
 Pins the v3 `Conversation` port (`src/model/conversation.ts`) against
