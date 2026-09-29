@@ -506,16 +506,24 @@ metadata refresh above were the first half):
 - **Current PR metadata outranks earlier discussion.** The corpus places
   `# Linked Issue Context` before every discussion section (PR
   conversation, review threads, human reviews), immediately after the PR
-  metadata that carries the body. The thread renderers take the PR's
-  last-edit instant (the raw PR object's `updated_at` — the deterministic
-  proxy for the latest description edit) as a superseded cutoff: comments
-  older than it are labeled "earlier discussion (may be superseded by the
-  current description)" and the section header states that the current
-  description and linked issues are authoritative. A v3-only prompt rule
-  tells the reviewer that a claim in earlier discussion which the current
-  description or a linked issue overrides is not a blocker. The cutoff is
-  passed only by the v3 run pipeline (refreshed after the CI wait), so the
-  v2-shared rendering and every parity boundary stay byte-identical.
+  metadata that carries the body. The thread renderers take a superseded
+  cutoff — the instant of the latest edit to the PR BODY, exposed through
+  the platform seam's optional `getPrBodyEditedAt` (GitHub: the GraphQL
+  `lastEditedAt`, which moves only on description edits and is null when
+  the body was never edited; the REST `updated_at` moves on every push or
+  comment and is deliberately NOT used). Comments older than the cutoff
+  are labeled "earlier discussion (may be superseded by the current
+  description)" and the section header states that the current
+  description and linked issues are authoritative. A backend without a
+  trustworthy body-edit timestamp — or a body never edited — yields no
+  cutoff, and nothing is softened: generic activity can never make a
+  blocking claim look superseded. A v3-only prompt rule tells the reviewer
+  that a claim in earlier discussion which the current description or a
+  linked issue overrides is not a blocker; the rule is (idempotently)
+  reapplied after the post-CI metadata refresh, so discussion that
+  appeared while CI ran is covered too. The cutoff and the rule are
+  applied only by the v3 run pipeline, so the v2-shared rendering and
+  every parity boundary stay byte-identical.
 
 ### The `conversation-rendering` boundary (#678)
 

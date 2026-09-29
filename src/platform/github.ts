@@ -3,6 +3,7 @@ import { validateEndpoint, type EndpointValidation } from "./endpoint.js";
 import { PlatformRequestError, requestJson, requestText, type FetchLike } from "./http.js";
 import {
   GITHUB_CONVERSATION_COMMENTS_QUERY,
+  GITHUB_PR_BODY_EDITED_AT_QUERY,
   GITHUB_REVIEW_THREADS_QUERY,
   normalizeExternalChecks,
   normalizeGithubConversationComments,
@@ -196,6 +197,22 @@ export class GitHubAdapter implements PlatformReadAdapter {
       return status === 200 ? text : "";
     } catch {
       return "";
+    }
+  }
+
+  /** #812: the PR body's last-edit instant — GraphQL `lastEditedAt`, which
+   * moves only when the description itself is edited. Any failed or
+   * unusable read returns null: without a trustworthy cutoff the
+   * superseded-discussion labeling softens nothing. */
+  async getPrBodyEditedAt(): Promise<string | null> {
+    const response = await this.graphql(GITHUB_PR_BODY_EDITED_AT_QUERY);
+    if (!response.ok) return null;
+    try {
+      const data = response.data as { data?: { repository?: { pullRequest?: { lastEditedAt?: unknown } } } | null } | null;
+      const value = data?.data?.repository?.pullRequest?.lastEditedAt;
+      return typeof value === "string" && value !== "" ? value : null;
+    } catch {
+      return null;
     }
   }
 

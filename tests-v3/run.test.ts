@@ -1208,7 +1208,10 @@ test("#812: a superseded thread claim is labeled and the authoritative sections 
   // the system prompt must carry the matching rule.
   const platform = mockPlatform({ body: "Closes #12.\n\nShadow qualification happens after merge." });
   const base = platform.getPr.bind(platform);
-  platform.getPr = async () => ({ ...(await base() as Record<string, unknown>), updated_at: "2026-09-28T10:00:00Z" }) as never;
+  // `updated_at` moved to 12:00 (generic activity); the label must follow the
+  // body edit at 10:00, which still postdates the 08:00 comment.
+  platform.getPr = async () => ({ ...(await base() as Record<string, unknown>), updated_at: "2026-09-28T12:00:00Z" }) as never;
+  platform.getPrBodyEditedAt = () => Promise.resolve("2026-09-28T10:00:00Z");
   platform.listPrConversationComments = () => Promise.resolve({
     ok: true,
     data: [{
@@ -1269,6 +1272,117 @@ test("#812: a superseded thread claim is labeled and the authoritative sections 
     const metadataAt = corpus.indexOf("# PR Metadata");
     assert.ok(metadataAt >= 0 && metadataAt < linkedAt);
     // The system prompt carries the superseded-discussion rule.
+    const request = readFileSync(join(runDir, "ai-request.primary.json"), "utf8");
+    assert.match(request, /authoritative context and outrank the discussion sections/);
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test("#812 review: generic PR activity without a description edit never softens a comment", async () => {
+  // A blocking comment at 08:00; a push moved updated_at to 12:00. Without a
+  // body-edit instant (no seam method, as on backends without one) — or with
+  // a body edit that OLDER than the claim — the cutoff must stay null/older
+  // and the comment must NOT be labeled superseded.
+  const server = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict()));
+  });
+  const { runDir, cleanup } = withRunDir();
+  try {
+    for (const bodyEditedAt of ["absent", "2026-09-28T07:00:00Z"]) {
+      const platform = mockPlatform({ body: "No description edit after the comment." });
+      const base = platform.getPr.bind(platform);
+      platform.getPr = async () => ({ ...(await base() as Record<string, unknown>), updated_at: "2026-09-28T12:00:00Z" }) as never;
+      if (bodyEditedAt !== "absent") platform.getPrBodyEditedAt = () => Promise.resolve(bodyEditedAt);
+      platform.listPrConversationComments = () => Promise.resolve({
+        ok: true,
+        data: [{
+          id: 1,
+          user: { login: "reviewer" },
+          created_at: "2026-09-28T08:00:00Z",
+          updated_at: "",
+          body: "Do not merge until X is fixed.",
+        }],
+      }) as never;
+      await runReview({
+        env: { GITHUB_OUTPUT: join(runDir, `gh-output-${bodyEditedAt}.txt`) },
+        inputs: {
+          "github-token": "tok",
+          repo: "o/r",
+          "pr-number": "7",
+          "ai-base-url": server.url,
+          "ai-model": "m",
+          "ai-stream": "false",
+          "ai-api-key": "k",
+          "ci-status-check": "false",
+        },
+        runDir,
+        workspace: runDir,
+        platformAdapter: platform,
+        persistArtifacts: true,
+        quiet: true,
+      });
+      const prThread = readFileSync(join(runDir, "pr-thread.md"), "utf8");
+      assert.ok(prThread.includes("Do not merge until X is fixed."), bodyEditedAt);
+      assert.ok(!prThread.includes("earlier discussion"), `comment must not be softened (${bodyEditedAt})`);
+      assert.ok(!prThread.includes("authoritative"), `no label, no authoritative note (${bodyEditedAt})`);
+      rmSync(join(runDir, "pr-thread.md"));
+    }
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test("#812 review: discussion appearing during the CI wait reapplies the superseded-discussion rule", async () => {
+  const requests: string[] = [];
+  const server = await startMockServer((_req, body, res) => {
+    requests.push(String(body));
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict()));
+  });
+  // Deterministic timing: the FIRST fetch (initial context stage) sees no
+  // comments; every later fetch (the post-CI rebuild) sees the one that
+  // landed while CI ran — independent of when the gate workload runs.
+  let commentsFetch = 0;
+  const platform = mockPlatform();
+  platform.listPrConversationComments = () => {
+    commentsFetch += 1;
+    return Promise.resolve({
+      ok: true,
+      data: commentsFetch >= 2
+        ? [{ id: 1, user: { login: "reviewer" }, created_at: "2026-09-28T08:00:00Z", updated_at: "", body: "A blocking claim appears while CI runs." }]
+        : [],
+    }) as never;
+  };
+  const { runDir, cleanup } = withRunDir();
+  try {
+    await runReview({
+      env: { GITHUB_OUTPUT: join(runDir, "gh-output.txt") },
+      inputs: {
+        "github-token": "tok",
+        repo: "o/r",
+        "pr-number": "7",
+        "ai-base-url": server.url,
+        "ai-model": "m",
+        "ai-stream": "false",
+        "ai-api-key": "k",
+        "ci-status-check": "true",
+      },
+      runDir,
+      workspace: runDir,
+      platformAdapter: platform,
+      // The gate runs to completion, so the post-CI metadata refresh fires.
+      ciGate: { file: "", envAllowlist: [], workload: async () => 0 },
+      persistArtifacts: true,
+      quiet: true,
+    });
+    // The rebuilt pr-thread section carries the late comment...
+    const prThread = readFileSync(join(runDir, "pr-thread.md"), "utf8");
+    assert.match(prThread, /A blocking claim appears while CI runs\./);
+    // ...and the system prompt sent to the model carries the rule.
     const request = readFileSync(join(runDir, "ai-request.primary.json"), "utf8");
     assert.match(request, /authoritative context and outrank the discussion sections/);
   } finally {

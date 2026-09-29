@@ -85,6 +85,14 @@ export interface PlatformReadAdapter extends PlatformAdapter {
   /** `platform_review_threads`: up to 100 inline review threads in the
    * review_threads.py shape. */
   listReviewThreads(): Promise<ReadResult<unknown[]>>;
+  /** #812: the instant of the latest edit to the PR's body/description,
+   * when the platform exposes one that is body-specific (GitHub: the
+   * GraphQL `lastEditedAt`, which never moves on pushes, comments or label
+   * changes, and is null when the body was never edited). Backends without
+   * a trustworthy body-edit timestamp do not implement this method: no
+   * cutoff, so the superseded-discussion labeling softens nothing. Never
+   * throws. */
+  getPrBodyEditedAt?(): Promise<string | null>;
   /** `platform_pr_reviews ... paginate`: every review, the shape
    * human_reviews.py consumes. */
   listPrReviewsPaginated(): Promise<ReadResult<unknown[]>>;

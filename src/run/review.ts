@@ -578,6 +578,12 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
       ws.write("pr-body.txt", String(pr.body ?? ""));
       await buildMetadataContext(pr);
       await buildPrThreadSection(ws, adapter, env);
+      // #812 review: discussion can appear while CI runs. The fragment is
+      // idempotent; without this reapplication the rebuilt corpus could
+      // carry discussion the system prompt has no superseded-discussion
+      // rule for.
+      promptState = applySupersededDiscussionFragment(promptState, ws);
+      env.SYSTEM_PROMPT = promptState.systemPrompt;
     }
   }
 

@@ -186,7 +186,7 @@ export async function buildReviewThreadsSection(ws: RunWorkspace, adapter: Platf
   ws.write("review-threads.raw.json", pyJsonDumps(fetched.data));
   try {
     const threads = prepareThreads(fetched.data);
-    const [markdown, rendered] = renderReviewThreads(threads, undefined, maxBytes, supersededCutoff(ws));
+    const [markdown, rendered] = renderReviewThreads(threads, undefined, maxBytes, await supersededCutoff(adapter));
     ws.write("review-threads.md", markdown);
     ws.write("review-threads.json", rendered.length > 0 ? `${pythonJsonStringify(threadEnforcementView(rendered))}\n` : "");
     ws.write("review-threads-present.txt", rendered.length > 0 ? `${rendered.length}\n` : "");
@@ -350,22 +350,27 @@ export async function buildPrThreadSection(ws: RunWorkspace, adapter: PlatformRe
   if (!fetched.ok) return;
   ws.write("pr-thread.json", pyJsonDumps(fetched.data));
   try {
-    const markdown = renderPrThread(fetched.data, undefined, undefined, Number(env.PR_THREAD_MAX_BYTES ?? "8000") || 8000, supersededCutoff(ws));
+    const markdown = renderPrThread(fetched.data, undefined, undefined, Number(env.PR_THREAD_MAX_BYTES ?? "8000") || 8000, await supersededCutoff(adapter));
     ws.write("pr-thread.md", markdown);
   } catch {
     ws.write("pr-thread.md", "");
   }
 }
 
-/** #812: the PR's last-edit instant — the raw PR object's `updated_at`, the
- * deterministic proxy for the latest description edit (GitHub and Forgejo
- * bump it on issue/PR body edits; comments do not). Null when unknown, which
- * leaves the thread sections unlabeled. Read fresh at each render: the
- * post-CI metadata refresh rewrites pr-object.json before re-rendering. */
-export function supersededCutoff(ws: RunWorkspace): string | null {
-  const raw = safeJson(ws.read("pr-object.json"));
-  const value = raw?.updated_at;
-  return typeof value === "string" && value.trim() !== "" ? value : null;
+/** #812: the superseded-discussion cutoff — the platform's body-edit
+ * timestamp (`getPrBodyEditedAt`; GitHub exposes the GraphQL `lastEditedAt`),
+ * which moves only when the PR description itself is edited. A backend
+ * without a trustworthy body-edit instant yields no cutoff, and the thread
+ * renderers then label nothing: generic activity (pushes, comments, label
+ * changes) can never soften a claim. Fetched at render time, so the
+ * post-CI metadata refresh picks up description edits made while CI ran. */
+export async function supersededCutoff(adapter: PlatformReadAdapter): Promise<string | null> {
+  try {
+    const value = await adapter.getPrBodyEditedAt?.();
+    return typeof value === "string" && value.trim() !== "" ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
