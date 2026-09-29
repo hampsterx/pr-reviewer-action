@@ -9,7 +9,7 @@ import { ForgejoAdapter } from "../src/platform/forgejo.js";
 import { GitHubAdapter, nextLink } from "../src/platform/github.js";
 import type { FetchLike } from "../src/platform/http.js";
 import { compareCodePoints, jqCompact } from "../src/platform/jq.js";
-import { GITHUB_CONVERSATION_COMMENTS_QUERY, GITHUB_PR_BODY_EDITED_AT_QUERY, GITHUB_REVIEW_THREADS_QUERY, normalizeExternalChecks, projectPrFiles } from "../src/platform/normalize.js";
+import { GITHUB_CONVERSATION_COMMENTS_QUERY, GITHUB_PR_BODY_REVISION_QUERY, GITHUB_REVIEW_THREADS_QUERY, normalizeExternalChecks, projectPrFiles } from "../src/platform/normalize.js";
 import { pyQuote, pyStr } from "../src/platform/py.js";
 import { parseRepoRef, repoScopedUrl } from "../src/platform/repo-ref.js";
 import { SemanticFixtureAdapter, semanticFixtureDir } from "../src/platform/semantic-fixture.js";
@@ -503,23 +503,28 @@ test("forgejo enrich: encoded traversal tags and specs make no request", async (
   assert.equal(calls, 1);
 });
 
-// ── #812: the body-edit timestamp seam ──────────────────────────────────
+// ── #812: the atomic body-revision seam ─────────────────────────────────
 
-test("github getPrBodyEditedAt exposes the GraphQL lastEditedAt; a failed read never invents a cutoff", async () => {
-  const { fetchImpl, seen } = recorder(() => json({ data: { repository: { pullRequest: { lastEditedAt: "2026-09-28T10:00:00Z" } } } }));
+test("github getPrBodyRevision returns body and lastEditedAt from ONE GraphQL document", async () => {
+  const { fetchImpl, seen } = recorder(() => json({ data: { repository: { pullRequest: { body: "BODY A", lastEditedAt: "2026-09-28T10:00:00Z" } } } }));
   const adapter = new GitHubAdapter({ repo: "o/r", prNumber: "1", fetchImpl });
-  assert.equal(await adapter.getPrBodyEditedAt(), "2026-09-28T10:00:00Z");
+  assert.deepEqual(await adapter.getPrBodyRevision(), { body: "BODY A", editedAt: "2026-09-28T10:00:00Z" });
   assert.equal(seen[0]!.url, "https://api.github.com/graphql");
   const sent = JSON.parse(seen[0]!.body!) as { query: string };
-  assert.equal(sent.query, GITHUB_PR_BODY_EDITED_AT_QUERY);
+  assert.equal(sent.query, GITHUB_PR_BODY_REVISION_QUERY);
+  assert.ok(sent.query.includes("body lastEditedAt"), "body and edit instant share one document");
 
-  // Never edited: the field is null — no cutoff.
-  const unedited = recorder(() => json({ data: { repository: { pullRequest: { lastEditedAt: null } } } }));
-  assert.equal(await new GitHubAdapter({ repo: "o/r", prNumber: "1", fetchImpl: unedited.fetchImpl }).getPrBodyEditedAt(), null);
+  // Never edited: lastEditedAt is null, the body still is the snapshot.
+  const unedited = recorder(() => json({ data: { repository: { pullRequest: { body: "BODY A", lastEditedAt: null } } } }));
+  assert.deepEqual(await new GitHubAdapter({ repo: "o/r", prNumber: "1", fetchImpl: unedited.fetchImpl }).getPrBodyRevision(), { body: "BODY A", editedAt: null });
 
-  // GraphQL errors and transport failures stay fail-soft: null, never a guess.
+  // A payload without a usable body is not a snapshot: null, never a guess.
+  const bodiless = recorder(() => json({ data: { repository: { pullRequest: { lastEditedAt: "2026-09-28T10:00:00Z" } } } }));
+  assert.equal(await new GitHubAdapter({ repo: "o/r", prNumber: "1", fetchImpl: bodiless.fetchImpl }).getPrBodyRevision(), null);
+
+  // GraphQL errors and transport failures stay fail-soft: null, no snapshot.
   const errored = recorder(() => json({ data: null, errors: [{ message: "nope" }] }));
-  assert.equal(await new GitHubAdapter({ repo: "o/r", prNumber: "1", fetchImpl: errored.fetchImpl }).getPrBodyEditedAt(), null);
+  assert.equal(await new GitHubAdapter({ repo: "o/r", prNumber: "1", fetchImpl: errored.fetchImpl }).getPrBodyRevision(), null);
   const failing = recorder(() => { throw new Error("down"); });
-  assert.equal(await new GitHubAdapter({ repo: "o/r", prNumber: "1", fetchImpl: failing.fetchImpl }).getPrBodyEditedAt(), null);
+  assert.equal(await new GitHubAdapter({ repo: "o/r", prNumber: "1", fetchImpl: failing.fetchImpl }).getPrBodyRevision(), null);
 });

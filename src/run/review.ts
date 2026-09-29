@@ -73,6 +73,7 @@ import {
   renderLinkedSourcesPhase,
   runEvidencePhase,
   runImageDigestPhase,
+  authoritativeBodyRevision,
   runToolHarnessPhase,
   safeJson,
   safeJsonArray,
@@ -323,6 +324,15 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     if (prObject !== null && prObject !== undefined) ws.write("pr-object.json", pyJsonDumps(prObject));
   }
   const pr = projectPr(prObject, prNumber);
+  // #812 review: the authoritative body and its edit instant are ONE atomic
+  // platform snapshot, fetched once per metadata pass. The snapshot's body
+  // is what the corpus presents and its `editedAt` the only cutoff the
+  // discussion renderers label with — a separately fetched timestamp could
+  // soften discussion against a description the corpus never showed. Null
+  // (no seam, failed read) keeps the REST body and labels nothing.
+  let bodyRevision = await authoritativeBodyRevision(adapter);
+  if (bodyRevision !== null) pr.body = bodyRevision.body;
+  let supersededCutoff = bodyRevision === null ? null : bodyRevision.editedAt;
   ws.write("pr.json", pyJsonDumps(pr));
   if (context.isForkPr === "") {
     env.IS_FORK_PR = deriveFork(prObject);
@@ -391,7 +401,7 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
   // PR-metadata-derived context (context.sh): linked issues + Linear, the
   // requirement ledger, review threads and human reviews. Built here and
   // again after the CI wait (#812), so edits made while CI runs are seen.
-  const buildMetadataContext = async (prRecord: typeof pr): Promise<Awaited<ReturnType<typeof buildLinkedIssueContext>>> => {
+  const buildMetadataContext = async (prRecord: typeof pr, passCutoff: string | null): Promise<Awaited<ReturnType<typeof buildLinkedIssueContext>>> => {
     // Linked issues + Linear (context.sh).
     const linkedResult = await buildLinkedIssueContext({
       pr: prRecord,
@@ -424,11 +434,11 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     for (const [name, data] of ledgerPresence.artifacts) ws.write(name, data);
 
     // Review threads + human reviews (context.sh).
-    await buildReviewThreadsSection(ws, adapter, env);
+    await buildReviewThreadsSection(ws, adapter, env, passCutoff);
     await buildHumanReviewsSection(ws, adapter, String(prRecord.headRefOid ?? ""), env);
     return linkedResult;
   };
-  const linked = await buildMetadataContext(pr);
+  const linked = await buildMetadataContext(pr, supersededCutoff);
 
   // Manifest context (context.sh tail).
   const manifest = buildManifestContext(prFilesRaw, workspace);
@@ -519,8 +529,8 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
 
   await Promise.all([enrichmentPromise, imageDigestPromise, evidencePromise]);
 
-  // PR-thread context (corpus.sh).
-  await buildPrThreadSection(ws, adapter, env);
+  // PR-thread context (corpus.sh) — same pass cutoff as the review threads.
+  await buildPrThreadSection(ws, adapter, env, supersededCutoff);
   // #812: the superseded-discussion rule, appended only now that the
   // discussion sections exist (the fragments phase runs before this stage).
   promptState = applySupersededDiscussionFragment(promptState, ws);
@@ -572,12 +582,18 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     const next = refreshed === null || refreshed === undefined ? null : projectPr(refreshed, prNumber);
     if (next !== null && String(next.headRefOid ?? "") === String(pr.headRefOid ?? "")) {
       log("Refreshing PR metadata context after the CI wait");
+      // A fresh atomic snapshot for the rebuilt pass: its body is presented
+      // and its `editedAt` is the only cutoff this pass labels with. A
+      // failed snapshot read keeps the REST-refreshed body and no cutoff.
+      bodyRevision = await authoritativeBodyRevision(adapter);
+      if (bodyRevision !== null) next.body = bodyRevision.body;
+      supersededCutoff = bodyRevision === null ? null : bodyRevision.editedAt;
       Object.assign(pr, next);
       ws.write("pr-object.json", pyJsonDumps(refreshed));
       ws.write("pr.json", pyJsonDumps(pr));
       ws.write("pr-body.txt", String(pr.body ?? ""));
-      await buildMetadataContext(pr);
-      await buildPrThreadSection(ws, adapter, env);
+      await buildMetadataContext(pr, supersededCutoff);
+      await buildPrThreadSection(ws, adapter, env, supersededCutoff);
       // #812 review: discussion can appear while CI runs. The fragment is
       // idempotent; without this reapplication the rebuilt corpus could
       // carry discussion the system prompt has no superseded-discussion

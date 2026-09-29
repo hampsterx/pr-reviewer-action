@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { runReview } from "../src/run/review.js";
+import { authoritativeBodyRevision, type PrBodyRevision } from "../src/run/stages.js";
 import { forkGate } from "../src/gates/gates.js";
 import { startMockServer } from "./helpers.js";
 import type { PlatformReadAdapter } from "../src/platform/types.js";
@@ -1206,12 +1207,16 @@ test("#812: a superseded thread claim is labeled and the authoritative sections 
   // corpus must order the authoritative sections (PR body, linked issues)
   // ahead of the discussion, label the pre-edit comment as superseded, and
   // the system prompt must carry the matching rule.
-  const platform = mockPlatform({ body: "Closes #12.\n\nShadow qualification happens after merge." });
+  const staleRestBody = "STALE-A: the body the ordinary PR read returned.";
+  const platform = mockPlatform({ body: staleRestBody });
   const base = platform.getPr.bind(platform);
   // `updated_at` moved to 12:00 (generic activity); the label must follow the
-  // body edit at 10:00, which still postdates the 08:00 comment.
+  // atomic body snapshot, whose edit at 10:00 postdates the 08:00 comment.
+  // The snapshot's body B differs from the REST body A: whichever body the
+  // cutoff describes is the one the corpus must present.
   platform.getPr = async () => ({ ...(await base() as Record<string, unknown>), updated_at: "2026-09-28T12:00:00Z" }) as never;
-  platform.getPrBodyEditedAt = () => Promise.resolve("2026-09-28T10:00:00Z");
+  const revisionBody = "Closes #12.\n\nShadow qualification happens after merge.";
+  platform.getPrBodyRevision = () => Promise.resolve({ body: revisionBody, editedAt: "2026-09-28T10:00:00Z" });
   platform.listPrConversationComments = () => Promise.resolve({
     ok: true,
     data: [{
@@ -1271,6 +1276,9 @@ test("#812: a superseded thread claim is labeled and the authoritative sections 
     assert.ok(linkedAt < threadAt, "linked issues precede the PR conversation");
     const metadataAt = corpus.indexOf("# PR Metadata");
     assert.ok(metadataAt >= 0 && metadataAt < linkedAt);
+    // Atomicity: the presented body is the revision the cutoff describes.
+    assert.ok(corpus.includes("Shadow qualification happens after merge."), "the snapshot body is the authoritative description");
+    assert.ok(!corpus.includes("STALE-A"), "the stale REST body is never presented beside the snapshot cutoff");
     // The system prompt carries the superseded-discussion rule.
     const request = readFileSync(join(runDir, "ai-request.primary.json"), "utf8");
     assert.match(request, /authoritative context and outrank the discussion sections/);
@@ -1291,11 +1299,13 @@ test("#812 review: generic PR activity without a description edit never softens 
   });
   const { runDir, cleanup } = withRunDir();
   try {
-    for (const bodyEditedAt of ["absent", "2026-09-28T07:00:00Z"]) {
+    for (const shape of ["no-revision-seam", "edit-older-than-comment"] as const) {
       const platform = mockPlatform({ body: "No description edit after the comment." });
       const base = platform.getPr.bind(platform);
       platform.getPr = async () => ({ ...(await base() as Record<string, unknown>), updated_at: "2026-09-28T12:00:00Z" }) as never;
-      if (bodyEditedAt !== "absent") platform.getPrBodyEditedAt = () => Promise.resolve(bodyEditedAt);
+      if (shape === "edit-older-than-comment") {
+        platform.getPrBodyRevision = () => Promise.resolve({ body: "No description edit after the comment.", editedAt: "2026-09-28T07:00:00Z" });
+      }
       platform.listPrConversationComments = () => Promise.resolve({
         ok: true,
         data: [{
@@ -1307,7 +1317,7 @@ test("#812 review: generic PR activity without a description edit never softens 
         }],
       }) as never;
       await runReview({
-        env: { GITHUB_OUTPUT: join(runDir, `gh-output-${bodyEditedAt}.txt`) },
+        env: { GITHUB_OUTPUT: join(runDir, `gh-output-${shape}.txt`) },
         inputs: {
           "github-token": "tok",
           repo: "o/r",
@@ -1325,9 +1335,9 @@ test("#812 review: generic PR activity without a description edit never softens 
         quiet: true,
       });
       const prThread = readFileSync(join(runDir, "pr-thread.md"), "utf8");
-      assert.ok(prThread.includes("Do not merge until X is fixed."), bodyEditedAt);
-      assert.ok(!prThread.includes("earlier discussion"), `comment must not be softened (${bodyEditedAt})`);
-      assert.ok(!prThread.includes("authoritative"), `no label, no authoritative note (${bodyEditedAt})`);
+      assert.ok(prThread.includes("Do not merge until X is fixed."), shape);
+      assert.ok(!prThread.includes("earlier discussion"), `comment must not be softened (${shape})`);
+      assert.ok(!prThread.includes("authoritative"), `no label, no authoritative note (${shape})`);
       rmSync(join(runDir, "pr-thread.md"));
     }
   } finally {
@@ -1389,4 +1399,21 @@ test("#812 review: discussion appearing during the CI wait reapplies the superse
     await server.close();
     cleanup();
   }
+});
+
+test("#812 review: authoritativeBodyRevision normalizes the snapshot and fails safe", async () => {
+  const adapter = (revision: unknown, method = true): PlatformReadAdapter =>
+    ({ ...(method ? { getPrBodyRevision: () => Promise.resolve(revision as PrBodyRevision | null) } : {}) } as unknown as PlatformReadAdapter);
+  // A usable snapshot passes through with a normalized editedAt.
+  assert.deepEqual(await authoritativeBodyRevision(adapter({ body: "B", editedAt: "2026-09-28T10:00:00Z" })), { body: "B", editedAt: "2026-09-28T10:00:00Z" });
+  assert.deepEqual(await authoritativeBodyRevision(adapter({ body: "B", editedAt: "" })), { body: "B", editedAt: null });
+  // No seam (backend without it), an explicit null, a malformed payload, a
+  // body that is not a string, and a throwing read all yield null: the REST
+  // body is presented and nothing is softened.
+  assert.equal(await authoritativeBodyRevision(adapter(null, false)), null);
+  assert.equal(await authoritativeBodyRevision(adapter(null)), null);
+  assert.equal(await authoritativeBodyRevision(adapter("nope")), null);
+  assert.equal(await authoritativeBodyRevision(adapter({ editedAt: "2026-09-28T10:00:00Z" })), null);
+  const throwing: PlatformReadAdapter = { getPrBodyRevision: () => Promise.reject(new Error("down")) } as unknown as PlatformReadAdapter;
+  assert.equal(await authoritativeBodyRevision(throwing), null);
 });

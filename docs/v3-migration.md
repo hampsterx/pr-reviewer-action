@@ -506,23 +506,27 @@ metadata refresh above were the first half):
 - **Current PR metadata outranks earlier discussion.** The corpus places
   `# Linked Issue Context` before every discussion section (PR
   conversation, review threads, human reviews), immediately after the PR
-  metadata that carries the body. The thread renderers take a superseded
-  cutoff — the instant of the latest edit to the PR BODY, exposed through
-  the platform seam's optional `getPrBodyEditedAt` (GitHub: the GraphQL
-  `lastEditedAt`, which moves only on description edits and is null when
-  the body was never edited; the REST `updated_at` moves on every push or
-  comment and is deliberately NOT used). Comments older than the cutoff
-  are labeled "earlier discussion (may be superseded by the current
-  description)" and the section header states that the current
-  description and linked issues are authoritative. A backend without a
-  trustworthy body-edit timestamp — or a body never edited — yields no
-  cutoff, and nothing is softened: generic activity can never make a
-  blocking claim look superseded. A v3-only prompt rule tells the reviewer
-  that a claim in earlier discussion which the current description or a
-  linked issue overrides is not a blocker; the rule is (idempotently)
-  reapplied after the post-CI metadata refresh, so discussion that
-  appeared while CI ran is covered too. The cutoff and the rule are
-  applied only by the v3 run pipeline, so the v2-shared rendering and
+  metadata that carries the body. Each metadata pass consumes ONE atomic
+  body snapshot from the platform seam's optional `getPrBodyRevision`: on
+  GitHub a single GraphQL document carries `body` and `lastEditedAt` (the
+  body's own edit instant — it moves only on description edits, is null
+  when the body was never edited; the REST `updated_at` moves on every
+  push or comment and is deliberately NOT used). The snapshot's body is
+  the authoritative description the corpus presents, and the same
+  `editedAt` is the only cutoff both discussion renderers of that pass
+  label with: comments older than it read "earlier discussion (may be
+  superseded by the current description)" and the section header states
+  that the current description and linked issues are authoritative. A
+  backend without the snapshot seam — or a failed or malformed read —
+  presents the REST-fetched body and labels nothing: a cutoff is never
+  paired with a body it does not describe, so generic activity can never
+  make a blocking claim look superseded. A v3-only prompt rule tells the
+  reviewer that a claim in earlier discussion which the current
+  description or a linked issue overrides is not a blocker; the rule is
+  (idempotently) reapplied after the post-CI metadata refresh, which
+  fetches a fresh atomic snapshot the same way, so discussion that
+  appeared while CI ran is covered too. The snapshot and the rule are
+  consumed only by the v3 run pipeline, so the v2-shared rendering and
   every parity boundary stay byte-identical.
 
 ### The `conversation-rendering` boundary (#678)

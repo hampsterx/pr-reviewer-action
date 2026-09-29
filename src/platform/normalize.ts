@@ -27,13 +27,14 @@ export const GITHUB_CONVERSATION_COMMENTS_QUERY =
 export const GITHUB_REVIEW_THREADS_QUERY =
   "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(last: 100) { nodes { id isResolved isOutdated path line originalLine comments(first: 50) { nodes { databaseId body createdAt updatedAt author { login } } } } } } } }";
 
-/** #812: `lastEditedAt` is the body's own edit timestamp — it moves only
- * when the description is edited (never on pushes, comments or label
- * changes) and is null when the body was never edited. The REST PR object
- * has no equivalent, which is why the superseded-discussion cutoff cannot
- * come from `updated_at`. */
-export const GITHUB_PR_BODY_EDITED_AT_QUERY =
-  "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { lastEditedAt } } }";
+/** #812: body and `lastEditedAt` in ONE document — the atomic snapshot the
+ * whole metadata pass consumes. `lastEditedAt` is the body's own edit
+ * timestamp: it moves only when the description is edited (never on pushes,
+ * comments or label changes) and is null when the body was never edited.
+ * The REST PR object has no equivalent, which is why the pair cannot come
+ * from two separate reads. */
+export const GITHUB_PR_BODY_REVISION_QUERY =
+  "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { body lastEditedAt } } }";
 
 // ── PR files ────────────────────────────────────────────────────────────
 
