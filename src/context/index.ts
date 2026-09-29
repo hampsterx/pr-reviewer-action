@@ -53,11 +53,14 @@ export {
   type RepoMap,
 } from "./repo-map.js";
 export {
+  AUTHORITATIVE_CONTEXT_NOTE,
   DEFAULT_MANAGED_MARKER,
   MAX_BYTES_DEFAULT,
   MAX_COMMENTS_DEFAULT,
   PER_COMMENT_MAX_BYTES,
+  SUPERSEDED_LABEL,
   filterComments,
+  predatesCutoff,
   prepareComments,
   renderPrThread,
   timestampSortKeyForTest,

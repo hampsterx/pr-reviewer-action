@@ -1199,3 +1199,80 @@ test("#812: unresolved bot threads re-emit with their original severity and Mino
     cleanup();
   }
 });
+
+test("#812: a superseded thread claim is labeled and the authoritative sections come first", async () => {
+  // The #814 shape: an old thread comment says "do not merge until X" while
+  // the current PR body and the linked issue say X happens after merge. The
+  // corpus must order the authoritative sections (PR body, linked issues)
+  // ahead of the discussion, label the pre-edit comment as superseded, and
+  // the system prompt must carry the matching rule.
+  const platform = mockPlatform({ body: "Closes #12.\n\nShadow qualification happens after merge." });
+  const base = platform.getPr.bind(platform);
+  platform.getPr = async () => ({ ...(await base() as Record<string, unknown>), updated_at: "2026-09-28T10:00:00Z" }) as never;
+  platform.listPrConversationComments = () => Promise.resolve({
+    ok: true,
+    data: [{
+      id: 1,
+      user: { login: "author" },
+      created_at: "2026-09-28T08:00:00Z",
+      updated_at: "",
+      body: "Do not merge until shadow qualification completes.",
+    }],
+  }) as never;
+  platform.getIssue = async () => ({
+    ok: true,
+    data: {
+      number: 12,
+      title: "sequencing",
+      state: "open",
+      html_url: "https://forge.example/o/r/issues/12",
+      labels: [],
+      body: "The qualification runs after merge.",
+    },
+  }) as never;
+  const server = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict()));
+  });
+  const { runDir, cleanup } = withRunDir();
+  try {
+    const result = await runReview({
+      env: { GITHUB_OUTPUT: join(runDir, "gh-output.txt") },
+      inputs: {
+        "github-token": "tok",
+        repo: "o/r",
+        "pr-number": "7",
+        "ai-base-url": server.url,
+        "ai-model": "m",
+        "ai-stream": "false",
+        "ai-api-key": "k",
+        "ci-status-check": "false",
+      },
+      runDir,
+      workspace: runDir,
+      platformAdapter: platform,
+      persistArtifacts: true,
+      quiet: true,
+    });
+    assert.equal(result.outputs.verdict, "approve");
+    // The pre-edit comment is labeled superseded; the section carries the
+    // authoritative-context note.
+    const prThread = readFileSync(join(runDir, "pr-thread.md"), "utf8");
+    assert.match(prThread, /## Comment by author — 2026-09-28T08:00:00Z — earlier discussion \(may be superseded by the current description\)/);
+    assert.match(prThread, /The current PR description and any linked issues are authoritative/);
+    // The corpus presents the authoritative sections before the discussion.
+    const corpus = readFileSync(join(runDir, "review-corpus.truncated.md"), "utf8");
+    const linkedAt = corpus.indexOf("# Linked Issue Context");
+    const threadAt = corpus.indexOf("# PR Thread Context");
+    assert.ok(linkedAt >= 0, "the linked issue reached the corpus");
+    assert.ok(linkedAt < threadAt, "linked issues precede the PR conversation");
+    const metadataAt = corpus.indexOf("# PR Metadata");
+    assert.ok(metadataAt >= 0 && metadataAt < linkedAt);
+    // The system prompt carries the superseded-discussion rule.
+    const request = readFileSync(join(runDir, "ai-request.primary.json"), "utf8");
+    assert.match(request, /authoritative context and outrank the discussion sections/);
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});

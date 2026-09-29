@@ -40,7 +40,7 @@ import { runSpecialistsGate } from "../gates/specialists-gate.js";
 import { buildModelRequest } from "../model/request.js";
 import { callModelTier, type TierProfile } from "../model/call.js";
 import { parseVerdictResponse } from "../model/verdict.js";
-import { annotateAnalysisEngine, analysisEngineBase, buildUserMessage, handleModelFailure, applySystemPromptFragments, applySpecialistLeadsFragment, resolveSystemPrompt } from "../prompt/index.js";
+import { annotateAnalysisEngine, analysisEngineBase, buildUserMessage, handleModelFailure, applySystemPromptFragments, applySpecialistLeadsFragment, applySupersededDiscussionFragment, resolveSystemPrompt } from "../prompt/index.js";
 import { reviewArtifactFromParsed } from "../enforcement/artifact.js";
 import { applyStrictVerdictPolicy, applyVerdictPolicy } from "../enforcement/verdict-policy.js";
 import { markerReviewResult } from "../publish/publish.js";
@@ -521,6 +521,10 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
 
   // PR-thread context (corpus.sh).
   await buildPrThreadSection(ws, adapter, env);
+  // #812: the superseded-discussion rule, appended only now that the
+  // discussion sections exist (the fragments phase runs before this stage).
+  promptState = applySupersededDiscussionFragment(promptState, ws);
+  env.SYSTEM_PROMPT = promptState.systemPrompt;
 
   // Corpus build #1 (initial review owns the primary artifact slot).
   const profileKey: "primary" | "smart" = env.REVIEW_CONTEXT_PROFILE === "smart" ? "smart" : "primary";

@@ -158,3 +158,30 @@ export function applySpecialistLeadsFragment(
   if (state.systemPrompt.includes(leads)) return state;
   return { ...state, systemPrompt: `${state.systemPrompt}\n${leads}` };
 }
+
+/**
+ * #812: the superseded-discussion rule, appended v3-only after the corpus's
+ * discussion sections exist (never by the v2-parity fragment assembly). The
+ * current PR description and linked issues are authoritative context, and a
+ * claim in earlier discussion they override is not a blocker — thread
+ * comments older than the latest description edit are labeled
+ * "earlier discussion (may be superseded by the current description)" in the
+ * corpus, so this rule tells the reviewer what that label means.
+ */
+export const SUPERSEDED_DISCUSSION_GUIDANCE =
+  "The current PR description and any linked issues are authoritative context and outrank the discussion sections: a claim in earlier discussion (PR conversation comments or review threads, including a comment labeled \"earlier discussion (may be superseded by the current description)\") that the current PR description or a linked issue overrides or supersedes is not a blocker and must not be cited as a merge gate.";
+
+/** Append `SUPERSEDED_DISCUSSION_GUIDANCE` once, when the default prompt is
+ * in use and the corpus carries discussion (the PR-thread or review-threads
+ * section); idempotent. Operator replace-mode prompts are left untouched,
+ * like every other fragment. */
+export function applySupersededDiscussionFragment(
+  state: SystemPromptState,
+  workspace: PromptWorkspace,
+): SystemPromptState {
+  if (!state.isDefault) return state;
+  if (state.systemPrompt.includes(SUPERSEDED_DISCUSSION_GUIDANCE)) return state;
+  const hasDiscussion = workspace.isNonEmpty("pr-thread.md") || workspace.isNonEmpty("review-threads.md");
+  if (!hasDiscussion) return state;
+  return { ...state, systemPrompt: `${state.systemPrompt}\n${SUPERSEDED_DISCUSSION_GUIDANCE}` };
+}
