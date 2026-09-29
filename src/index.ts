@@ -40,12 +40,19 @@ import { runCiGateFixture } from "./gates/ci-wait-fixture.js";
 import { runSpecialistsGateFixture } from "./gates/specialists-gate-fixture.js";
 import { CI_GATE_SUBMODE, SPECIALIST_GATE_SUBMODE, ciGateMain, exitAfterFlush, specialistsGateMain } from "./gates/workloads.js";
 import { runReview, RunReviewError } from "./run/index.js";
+import { precheckMain, publishMain } from "./run/entrypoints.js";
+import { actionMain } from "./run/action.js";
 import { runEvidenceProvidersFixture } from "./evidence/fixture.js";
 
 export function main(): void {
   assertSupportedNode(process.versions.node);
   const contract = validateContract(V3_CONTRACT);
-  const raw: Record<string, string | undefined> = Object.fromEntries(contract.inputs.map(({ id }) => [id, process.env[`INPUT_${id.toUpperCase().replaceAll("-", "_")}`]]));
+  const raw: Record<string, string | undefined> = Object.fromEntries(contract.inputs.map(({ id }) => [
+    id,
+    // Kebab IDs are exported literally (`INPUT_GITHUB-TOKEN`); the
+    // underscore form is the compatibility fallback.
+    process.env[`INPUT_${id.toUpperCase()}`] ?? process.env[`INPUT_${id.toUpperCase().replaceAll("-", "_")}`],
+  ]));
   // #727/#777: read repository config from the trusted base ref, never the
   // PR head. `PR_REVIEWER_BASE_REF` is the base commit-ish the platform/
   // precheck layer resolves (see `src/platform/pr.ts`'s `PrIdentity.baseSha`);
@@ -121,7 +128,28 @@ if (require.main === module) {
   const argv = process.argv.slice(2);
   const mode = process.env.PR_REVIEWER_V3_MODE ?? "";
   const firstArg = argv[0] ?? "";
-  if (firstArg === "run") {
+  if (process.env.PR_REVIEWER_GATE_CHILD === "1" && firstArg !== CI_GATE_SUBMODE && firstArg !== SPECIALIST_GATE_SUBMODE) {
+    // Recursion guard: a gate child only ever runs its gate workload.
+    process.stderr.write(`v3 runtime: refusing '${firstArg || "<action>"}' inside a gate child process\n`);
+    process.exit(1);
+  }
+  if (firstArg === "precheck") {
+    assertSupportedNode(process.versions.node);
+    precheckMain(process.env)
+      .then((code) => exitAfterFlush(code))
+      .catch((error: unknown) => {
+        process.stderr.write(`v3 precheck error: ${error instanceof Error ? error.message : "unknown error"}\n`);
+        exitAfterFlush(2);
+      });
+  } else if (firstArg === "publish") {
+    assertSupportedNode(process.versions.node);
+    publishMain(process.env)
+      .then((code) => exitAfterFlush(code))
+      .catch((error: unknown) => {
+        process.stderr.write(`v3 publish error: ${error instanceof Error ? error.message : "unknown error"}\n`);
+        exitAfterFlush(1);
+      });
+  } else if (firstArg === "run") {
     // The end-to-end review orchestrator (#809): the typed successor of
     // scripts/run_review.sh. Never publishes — the publish boundary stays
     // with the composite's publish step until #706/#681.
@@ -274,12 +302,26 @@ if (require.main === module) {
   } else if (mode !== "") {
     process.stderr.write(`v3 runtime: unknown parity mode '${mode}'\n`);
     process.exitCode = 1;
-  } else {
+  } else if (firstArg === "config") {
+    // Validate the inputs and (with PR_REVIEWER_V3_DEBUG=true) print the
+    // resolved, redacted config.
     try {
       main();
     } catch (error) {
       process.stderr.write(`v3 runtime configuration error: ${error instanceof Error ? error.message : "unknown error"}\n`);
       process.exitCode = 1;
     }
+  } else if (firstArg === "") {
+    // The JavaScript action entry (`runs.using: node24`, `main: dist/index.js`).
+    assertSupportedNode(process.versions.node);
+    actionMain(process.env)
+      .then((code) => { exitAfterFlush(code); })
+      .catch((error: unknown) => {
+        process.stdout.write(`::error::${error instanceof Error ? error.message : "unknown error"}\n`);
+        exitAfterFlush(error instanceof RunReviewError ? error.exitCode : 1);
+      });
+  } else {
+    process.stderr.write(`v3 runtime: unknown command '${firstArg}'\n`);
+    process.exitCode = 1;
   }
 }

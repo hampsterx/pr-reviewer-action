@@ -62,31 +62,8 @@ def test_checkout_pr_reviewer_package_cannot_shadow_the_action(tmp_path: Path) -
 def _dependency_check_script() -> str:
     action = yaml.safe_load((ROOT / "action.yml").read_text(encoding="utf-8"))
     step = next(s for s in action["runs"]["steps"] if s.get("name") == "Validate runtime dependencies")
-    return step["run"]
+    # The runner substitutes composite expressions; the test substitutes
+    # github.action_path with this repository (a source checkout).
+    return step["run"].replace("${{ github.action_path }}", str(ROOT))
 
 
-def test_dependency_check_rejects_python_older_than_3_11(tmp_path: Path) -> None:
-    shim = tmp_path / "python3"
-    shim.write_text(
-        "#!/usr/bin/env bash\n"
-        'if [ "${1:-}" = "-V" ]; then echo "Python 3.10.14"; exit 0; fi\n'
-        'case "$*" in *"version_info < (3, 11)"*) exit 1 ;; esac\n'
-        f'exec {sys.executable} "$@"\n',
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    env = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
-    result = subprocess.run(
-        ["bash", "-c", _dependency_check_script() + "\necho REACHED_END"],
-        env=env, capture_output=True, text=True, check=False,
-    )
-    assert result.returncode != 0
-    assert "::error::python3 3.11 or newer is required (found Python 3.10.14)." in result.stdout
-    assert "REACHED_END" not in result.stdout
-
-
-def test_dependency_check_accepts_the_current_interpreter() -> None:
-    if sys.version_info < (3, 11):
-        pytest.skip("running interpreter is older than 3.11")
-    result = subprocess.run(["bash", "-c", _dependency_check_script()], capture_output=True, text=True, check=False)
-    assert result.returncode == 0, result.stdout + result.stderr

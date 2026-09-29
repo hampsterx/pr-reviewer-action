@@ -8,6 +8,7 @@ import { resolveTierBudgets } from "../corpus/budgets.js";
 import { prioritizeDiff } from "../corpus/diff-priority.js";
 import { truncateClean } from "../corpus/truncate.js";
 import { readFileSync, appendFileSync } from "node:fs";
+import { join } from "node:path";
 import { canonicalChangedFile } from "../context/types.js";
 import { pythonJsonStringify } from "../precheck/metadata.js";
 import { buildHarnessObligations } from "../requirements/obligations.js";
@@ -137,6 +138,11 @@ export interface RunReviewResult {
   classification: Record<string, unknown>;
   ciGate: GateOutcome;
   specialistGate: GateOutcome;
+  /** The resolved verdict policy, plus the #810 coverage record and the #812
+   * CI conclusion the publish step needs for the marker and body. */
+  verdictPolicy: string;
+  partialCoverage?: PartialCoverage;
+  ciState?: string;
   /** Wall-clock seconds for the whole run. */
   durationSec: number;
 }
@@ -152,6 +158,65 @@ const NO_GATE_OUTCOME = (gate: GateName): GateOutcome => ({
   survivedPids: [],
 });
 
+/** Scratch file the CI gate child writes its step outputs to. */
+const CI_GATE_OUTPUT_FILE = "ci-gate-outputs.txt";
+
+/** The CI gate's `ci_status_final` / `ci_status_skipped` step outputs as the
+ * contract's kebab-case output assignments. */
+export function ciGateOutputs(path: string): string {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
+  const values = new Map<string, string>();
+  for (const line of text.split("\n")) {
+    const match = /^(ci_status_final|ci_status_skipped)=([A-Za-z_-]*)$/.exec(line.trim());
+    if (match) values.set(match[1]!.replaceAll("_", "-"), match[2]!);
+  }
+  return [...values].map(([key, value]) => `${key}=${value}\n`).join("");
+}
+
+/** Set on every gate child; a process carrying it never starts a review. */
+export const GATE_CHILD_ENV = "PR_REVIEWER_GATE_CHILD";
+
+/** The bundle a gate child is launched from: an explicit PR_REVIEWER_ENTRY,
+ * or this process's own entry when it is the built `dist/index.js`. Anything
+ * else (a test runner file) is not a runtime entry — launching it would
+ * re-run that file instead of the gate. */
+export function runtimeBundleEntry(env: NodeJS.ProcessEnv): string | null {
+  const explicit = env.PR_REVIEWER_ENTRY ?? "";
+  if (explicit !== "") return explicit;
+  const own = process.argv[1] ?? "";
+  return /(?:^|[\\/])dist[\\/]index\.js$/.test(own) ? own : null;
+}
+
+/** The contract inputs as the runner exports them: `INPUT_<ID>` with kebab
+ * IDs kept literally (`INPUT_GITHUB-TOKEN`), then the underscore form, the
+ * v2 SCREAMING_SNAKE binding, and GH_TOKEN/GITHUB_TOKEN for the token. */
+export function rawInputsFromEnv(
+  contract: ReturnType<typeof validateContract>,
+  env: NodeJS.ProcessEnv,
+): Record<string, string | undefined> {
+  const options = { env };
+  return Object.fromEntries(contract.inputs.map(({ id, v2_id }) => [
+      id,
+      // The runner exports composite inputs as INPUT_<ID uppercased
+      // literally — kebab IDs keep their hyphens (`INPUT_GITHUB-TOKEN`).
+      // The underscore form and the composite's SCREAMING_SNAKE bindings
+      // (the v2 names, unchanged — only the public IDs went kebab) are the
+      // compatibility fallbacks.
+      options.env[`INPUT_${id.toUpperCase()}`]
+        ?? options.env[`INPUT_${id.toUpperCase().replaceAll("-", "_")}`]
+        ?? (v2_id !== undefined && v2_id !== "" ? options.env[v2_id.toUpperCase()] : undefined)
+        // The token rides the shared env file as GH_TOKEN/GITHUB_TOKEN (the
+        // composite's only token consumer is the platform auth binding);
+        // the runner does not export a hyphenated INPUT_ name for it.
+        ?? (id === "github-token" ? (options.env.GH_TOKEN ?? options.env.GITHUB_TOKEN) : undefined),
+    ]));
+}
+
 export async function runReview(options: RunReviewOptions): Promise<RunReviewResult> {
   const clock = options.now ?? ((): number => Date.now() / 1000);
   const started = clock();
@@ -163,12 +228,15 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     (options.error ?? ((text) => process.stderr.write(`[v3] ERROR: ${text}\n`)))(line);
 
   assertSupportedNode(process.versions.node);
+  if (options.env[GATE_CHILD_ENV] === "1") {
+    throw new RunReviewError("refusing to start a review inside a gate child process");
+  }
   const contract = validateContract(V3_CONTRACT);
 
   // ── Config stage (config.sh) ─────────────────────────────────────────
   const raw: Record<string, string | undefined> = options.inputs
     ? { ...options.inputs }
-    : Object.fromEntries(contract.inputs.map(({ id }) => [id, options.env[`INPUT_${id.toUpperCase().replaceAll("-", "_")}`]]));
+    : rawInputsFromEnv(contract, options.env);
   const baseRef = options.env.PR_REVIEWER_BASE_REF ?? "";
   let effectiveRaw = raw;
   if (baseRef !== "") {
@@ -427,10 +495,21 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
   const scope = createCancellationScope();
   let ciFork: ForkedGate | null = null;
   if ((env.CI_STATUS_CHECK ?? "false").toLowerCase() === "true" && options.ciGate !== null) {
-    const entry = options.ciGateEntry ?? process.argv[1] ?? "";
-    ciFork = await forkGate("ci", options.ciGate ?? ciGateBranch({ entry }), { ambientEnv: options.env, scope });
-    log("CI status gating launched concurrently");
-    env.CI_GATE_ACTIVE = "true";
+    const entry = options.ciGate ? "" : (options.ciGateEntry ?? runtimeBundleEntry(options.env));
+    if (options.ciGate || entry !== null) {
+      // The gate child is marked so it can never start a review (or another
+      // gate) itself: the recursion stops at depth one.
+      ciFork = await forkGate("ci", options.ciGate ?? ciGateBranch({ entry: entry ?? "" }), {
+        // The gate writes its v2 step outputs (ci_status_final/skipped) to a
+        // scratch file; the run republishes them under the contract names.
+        ambientEnv: { ...options.env, [GATE_CHILD_ENV]: "1", GITHUB_OUTPUT: join(runDir, CI_GATE_OUTPUT_FILE) },
+        scope,
+      });
+      log("CI status gating launched concurrently");
+      env.CI_GATE_ACTIVE = "true";
+    } else {
+      log("CI status gating skipped: no runtime bundle entry to launch it from");
+    }
   }
 
   await Promise.all([enrichmentPromise, imageDigestPromise, evidencePromise]);
@@ -472,6 +551,7 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     const outcome = await ciFork.join();
     env.CI_GATE_ACTIVE = outcome.ran ? "true" : "false";
     if (!outcome.ok) log("CI status gating exited non-zero; continuing (CI evidence is advisory)");
+    persistOutputs(context.outputFilePath, ciGateOutputs(join(runDir, CI_GATE_OUTPUT_FILE)));
   }
 
   // #812: the PR body, linked issues and thread context are re-read after
@@ -706,6 +786,9 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     ciGate: ciFork === null ? NO_GATE_OUTCOME("ci") : await ciFork.join(),
     specialistGate: specialistOutcome,
     durationSec: Math.max(0, finished - started),
+    verdictPolicy,
+    ...(partialCoverage ? { partialCoverage } : {}),
+    ...(ciState !== undefined ? { ciState } : {}),
   };
 }
 

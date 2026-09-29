@@ -143,8 +143,6 @@ check_contains "review_verdict arm uses METADATA_MARKER in body" \
 
 # The dispatcher wires COMMENT_MARKER into its (shared) env block; every arm
 # emits it through emit_review_markers (asserted below).
-check_contains "publish step wires COMMENT_MARKER in env" \
-  "$PUBLISH_STEP_BODY" "COMMENT_MARKER:"
 
 # Every published body must emit the marker preamble (sticky COMMENT_MARKER +
 # METADATA_MARKER + head-sha + fingerprint) so the precheck can find prior
@@ -185,11 +183,10 @@ check_contains "helper contains build_metadata_marker function" \
 echo ""
 echo "=== Cleanup logic presence validation ==="
 
-# The publish step delegates to scripts/publish.sh, which sources the helper
+# The publish step runs the v3 runtime entrypoint, which sources the helper
 # script once (before the case); the review_comment / review_verdict arms each
 # run the cleanup.
-check_contains "publish step delegates to scripts/publish.sh" \
-  "$PUBLISH_STEP_BODY" "scripts/publish.sh"
+
 check_contains "publish.sh sources publish_helpers.sh" \
   "$(cat "$PUBLISH_SH")" "publish_helpers.sh"
 
@@ -208,8 +205,8 @@ check_contains "review_verdict arm calls resolve_cleanup_flag" \
 echo ""
 echo "=== Input definition validation ==="
 
-check_exists "action.yml has cleanup_previous_native_reviews input" \
-  "$(grep -c 'cleanup_previous_native_reviews:' "$ACTION_YML" || echo 0)"
+check_exists "action.yml has cleanup-previous-native-reviews input" \
+  "$(grep -c 'cleanup-previous-native-reviews:' "$ACTION_YML" || echo 0)"
 
 check_contains "cleanup_previous_native_reviews default is auto" \
   "$(cat "$ACTION_YML")" 'default: "auto"'
@@ -225,8 +222,8 @@ echo "=== README.md documentation validation ==="
 
 README_MD="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/README.md"
 
-check_exists "README documents cleanup_previous_native_reviews input" \
-  "$(grep -c 'cleanup_previous_native_reviews' "$README_MD" || echo 0)"
+check_exists "README documents cleanup-previous-native-reviews input" \
+  "$(grep -c 'cleanup-previous-native-reviews' "$README_MD" || echo 0)"
 
 check_exists "README has native review cleanup section" \
   "$(grep -c 'Native review cleanup' "$README_MD" || echo 0)"

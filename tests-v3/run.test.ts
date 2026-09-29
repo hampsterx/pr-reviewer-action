@@ -312,6 +312,67 @@ test("missing required inputs fail closed with the v2 message", async () => {
   }
 });
 
+test("contract inputs resolve from the literal kebab INPUT_ names the runner exports", async () => {
+  const server = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict()));
+  });
+  const { runDir, cleanup } = withRunDir();
+  try {
+    // Only the literal hyphenated form is set — the underscore fallback and
+    // the SCREAMING_SNAKE v2 names are absent.
+    const result = await runReview({
+      env: {
+        "INPUT_GITHUB-TOKEN": "tok",
+        "INPUT_AI-BASE-URL": server.url,
+        "INPUT_AI-MODEL": "m",
+        "INPUT_AI-STREAM": "false",
+        "INPUT_AI-API-KEY": "k",
+        "INPUT_PR-NUMBER": "7",
+        "INPUT_REPO": "o/r",
+      },
+      runDir,
+      workspace: runDir,
+      platformAdapter: mockPlatform(),
+      quiet: true,
+    });
+    assert.equal(result.outputs.verdict, "approve");
+    assert.equal(result.reviewArtifact.verdict, "approve");
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test("github-token resolves from the shared GH_TOKEN binding when no INPUT_ form is exported", async () => {
+  const server = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict()));
+  });
+  const { runDir, cleanup } = withRunDir();
+  try {
+    const result = await runReview({
+      env: {
+        GH_TOKEN: "shared-token",
+        REPO: "o/r",
+        PR_NUMBER: "7",
+        "INPUT_AI-BASE-URL": server.url,
+        "INPUT_AI-MODEL": "m",
+        "INPUT_AI-STREAM": "false",
+        "INPUT_AI-API-KEY": "k",
+      },
+      runDir,
+      workspace: runDir,
+      platformAdapter: mockPlatform(),
+      quiet: true,
+    });
+    assert.equal(result.outputs.verdict, "approve");
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
 test("embedded specialist prompts equal the committed fragment files", async () => {
   // Guards the #809 switch from disk reads to the build-time asset map.
   const { loadSpecialistPrompt } = await import("../src/specialists/prompts.js");
@@ -841,5 +902,55 @@ test("deep review writes its artifacts where the run reads them when the run dir
     await server.close();
     cleanup();
     rmSync(checkout, { recursive: true, force: true });
+  }
+});
+
+test("recursion guard: a gate child process never starts a review", async () => {
+  await assert.rejects(
+    runReview({ env: { PR_REVIEWER_GATE_CHILD: "1" }, inputs: {}, quiet: true }),
+    /inside a gate child/,
+  );
+});
+
+test("the CI gate only launches from a real bundle entry, never the test runner file", async () => {
+  const { runtimeBundleEntry } = await import("../src/run/review.js");
+  // This process's argv[1] is a test file, not dist/index.js.
+  assert.equal(runtimeBundleEntry({}), null);
+  assert.equal(runtimeBundleEntry({ PR_REVIEWER_ENTRY: "/x/dist/index.js" }), "/x/dist/index.js");
+  // CI gating on with no override: skipped with a log line, no child spawned.
+  const server = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict()));
+  });
+  const { runDir, cleanup } = withRunDir();
+  const lines: string[] = [];
+  try {
+    const result = await runReview({
+      env: { GITHUB_OUTPUT: join(runDir, "gh-output.txt") },
+      inputs: { "github-token": "tok", repo: "o/r", "pr-number": "7", "ai-base-url": server.url, "ai-model": "m", "ai-stream": "false", "ai-api-key": "k", "ci-status-check": "true" },
+      runDir,
+      workspace: runDir,
+      platformAdapter: mockPlatform(),
+      persistArtifacts: false,
+      log: (line) => lines.push(line),
+    });
+    assert.equal(result.ciGate.ran, false);
+    assert.ok(lines.some((line) => /CI status gating skipped/.test(line)));
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test("the CI gate's v2 step outputs are republished under the contract's kebab names", async () => {
+  const { ciGateOutputs } = await import("../src/run/review.js");
+  const { runDir, cleanup } = withRunDir();
+  try {
+    const file = join(runDir, "ci-gate-outputs.txt");
+    writeFileSync(file, "ci_status_final=success\nci_status_skipped=false\nunrelated=1\n");
+    assert.equal(ciGateOutputs(file), "ci-status-final=success\nci-status-skipped=false\n");
+    assert.equal(ciGateOutputs(join(runDir, "missing.txt")), "");
+  } finally {
+    cleanup();
   }
 });
