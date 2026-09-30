@@ -12,6 +12,8 @@ import { publishReview, type PublishInput, type PublishResult, type PublishMode 
 import type { PublishPlatformApi } from "../platform/publish-api.js";
 import type { UpstreamLinkMode } from "../publish/sanitize.js";
 import { nonEmpty } from "./run-dir.js";
+import { partialCoverageOf } from "./review.js";
+import type { PartialCoverage } from "../tools/coverage.js";
 
 /**
  * Production entrypoints for the #706 composite cutover: the precheck and
@@ -145,6 +147,128 @@ function isFileNonEmpty(env: NodeJS.ProcessEnv, name: string): boolean {
   }
 }
 
+function readJsonObject(path: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The result of resolving #810's coverage-gap record for the `publish` CLI
+ * path. `unknown: true` (no explicit run dir, an unreadable/unrecognizable
+ * artifact, or — when the tool loop ran — a harness pointer that can't be
+ * trusted) is distinct from a confirmed-complete run: it means publish
+ * could not confirm the coverage state at all, and must fail closed for
+ * approval exactly as a confirmed gap does — see `partialCoverageFromRunDir`
+ * below. `requiredChecks` is always a validated value (never ambient env,
+ * never a normalization of an absent/invalid recorded value — that case is
+ * `unknown: true` with the conservative "incomplete"): see
+ * `validateRequiredChecks`. */
+interface CoverageResolution {
+  partialCoverage: PartialCoverage | undefined;
+  unknown: boolean;
+  requiredChecks: string;
+}
+
+/** Validates one field of #873's authoritative `review-coverage.json`
+ * artifact (see the write site in `review.ts`) — the same shape check
+ * `partialCoverageOf` applies to a raw harness's `partial_coverage` field,
+ * reused here since the artifact stores the identical structure directly. */
+function parsePartialCoverageField(value: unknown): PartialCoverage | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && typeof (value as { stop_reason?: unknown }).stop_reason === "string"
+    ? value as PartialCoverage
+    : undefined;
+}
+
+/** The exact value set `completeness.ts`'s `RequiredCheckValidationResult.
+ * status` (and so `review.ts`'s `required_checks` artifact field) can
+ * produce. Anything else — absent, malformed, a future schema addition — is
+ * not a known status: the resolution fails closed (unknown coverage, and
+ * the publish input conservatively carries "incomplete") rather than
+ * normalizing to "none", which is a legitimate *recorded* status (no
+ * required checks configured) and therefore approve-eligible — not a
+ * sentinel. */
+const REQUIRED_CHECKS_VALUES: ReadonlySet<string> = new Set(["complete", "incomplete", "none"]);
+
+function validateRequiredChecks(value: unknown): string | undefined {
+  return typeof value === "string" && REQUIRED_CHECKS_VALUES.has(value) ? value : undefined;
+}
+
+/** The only two harness filenames `review.ts` ever records as
+ * `enforcement_harness` (see its write site). An allowlist, not a
+ * traversal check: `readJsonObject` is only ever called with one of these
+ * two literal strings joined to the run dir, so a forged value like
+ * `"../x.json"` is simply never a member and is never read at all — it
+ * fails the resolution below exactly like `null` or any other stray
+ * string would. */
+const ENFORCEMENT_HARNESS_NAMES: ReadonlySet<string> = new Set(["tool-harness.json", "tool-harness.smart.json"]);
+
+/** #873 maintainer follow-up: the `publish` CLI subcommand is a separate
+ * process from `run`, so it cannot hold `toolMode`/`enforcementHarness`/
+ * `required_checks` in memory — and re-deriving any of them from ambient
+ * stage env (`TOOL_MODE`, `REVIEW_ROUTE`, `REQUIRED_CHECKS`) is exactly the
+ * hole this closes: any of those vars can be omitted, stale, or simply
+ * wrong for the run actually being published, letting a partial run read
+ * as clean (or a clean run's harness never get consulted). `run`
+ * (`review.ts`) instead writes its own authoritative `review-coverage.json`
+ * — the one file that always reflects what THIS run actually did — and
+ * `publish` reads only that, from the same explicit, non-empty
+ * `PR_REVIEWER_RUN_DIR` `isFileNonEmpty` above already requires (never
+ * `GITHUB_WORKSPACE`/the process cwd — the reviewed checkout, per #838).
+ *
+ * Three coverage states, not two:
+ * - no explicit run dir, or the artifact is missing/unparseable/
+ *   structurally unrecognizable: UNKNOWN — `run` should always have
+ *   written this file; publish fails closed rather than guess.
+ * - `tool_loop_ran: false` (tool-mode was off for this run): no harness
+ *   was ever expected, so there is no gap — a tools-off review can still
+ *   approve.
+ * - `tool_loop_ran: true`: the artifact's own recorded `partial_coverage`
+ *   is authoritative on its own when it's a well-formed confirmed gap —
+ *   no need to also read the harness. Otherwise (no confirmed gap
+ *   recorded), the ONLY way to confirm the run was actually complete is to
+ *   read the exact harness `enforcement_harness` names: that name must be
+ *   exactly `tool-harness.json` or `tool-harness.smart.json` (anything
+ *   else, including `null`, is never read and resolves UNKNOWN), and the
+ *   named file must exist and parse (missing/unparseable also resolves
+ *   UNKNOWN, never "must have been clean"). Only a harness that reads
+ *   cleanly settles the question, either way. */
+function partialCoverageFromRunDir(env: NodeJS.ProcessEnv): CoverageResolution {
+  const runDir = nonEmpty(env.PR_REVIEWER_RUN_DIR);
+  if (runDir === undefined) return { partialCoverage: undefined, unknown: true, requiredChecks: "none" };
+  const artifact = readJsonObject(join(runDir, "review-coverage.json"));
+  if (artifact === null || artifact.version !== 1 || typeof artifact.tool_loop_ran !== "boolean") {
+    return { partialCoverage: undefined, unknown: true, requiredChecks: "none" };
+  }
+  const requiredChecks = validateRequiredChecks(artifact.required_checks);
+  if (requiredChecks === undefined) {
+    // #873 maintainer follow-up: the run writer always emits this field, so
+    // an absent or invalid value means the artifact is not one this runtime
+    // wrote. Normalizing to "none" would be approve-eligible; fail closed
+    // instead — coverage unknown, and the publish input carries the
+    // conservative "incomplete" so no policy branch can read the
+    // required-check dimension as clean.
+    return { partialCoverage: undefined, unknown: true, requiredChecks: "incomplete" };
+  }
+  if (!artifact.tool_loop_ran) return { partialCoverage: undefined, unknown: false, requiredChecks };
+
+  const recordedGap = parsePartialCoverageField(artifact.partial_coverage);
+  if (recordedGap !== undefined) return { partialCoverage: recordedGap, unknown: false, requiredChecks };
+
+  const harnessName = typeof artifact.enforcement_harness === "string" && ENFORCEMENT_HARNESS_NAMES.has(artifact.enforcement_harness)
+    ? artifact.enforcement_harness
+    : undefined;
+  if (harnessName === undefined) return { partialCoverage: undefined, unknown: true, requiredChecks };
+  const harness = readJsonObject(join(runDir, harnessName));
+  if (harness === null) return { partialCoverage: undefined, unknown: true, requiredChecks };
+  return { partialCoverage: partialCoverageOf(harness), unknown: false, requiredChecks };
+}
+
 /** The platform publish seam (GitHub REST/GraphQL or Forgejo /api/v1). */
 export function buildPublishApi(env: NodeJS.ProcessEnv): { api: PublishPlatformApi; platform: string; diffProvider: () => Promise<string> } {
   const repo = env.REPO ?? "";
@@ -170,6 +294,12 @@ export function buildPublishApi(env: NodeJS.ProcessEnv): { api: PublishPlatformA
 /** PublishInput from the stage environment (the composite's publish-step
  * bindings, or the action entry's in-process equivalents). */
 export function publishInputFromEnv(env: NodeJS.ProcessEnv, platform: string): PublishInput {
+  // #873 maintainer follow-up: resolved once so `requiredChecks` and the
+  // coverage-gap fields below come from the SAME read of the run's own
+  // authoritative artifact — never from ambient `REQUIRED_CHECKS` stage
+  // env, which (like `TOOL_MODE`/`REVIEW_ROUTE` before it) can be omitted
+  // or stale for the run actually being published.
+  const coverage = partialCoverageFromRunDir(env);
   return {
     mode: publishMode(env.PUBLISH_MODE),
     reviewMarkdown: env.REVIEW_MARKDOWN ?? "",
@@ -180,7 +310,7 @@ export function publishInputFromEnv(env: NodeJS.ProcessEnv, platform: string): P
     prNumber: env.PR_NUMBER ?? "",
     commentMarker: env.COMMENT_MARKER ?? "",
     ...(env.BROAD_FINGERPRINT !== undefined ? { broadFingerprint: env.BROAD_FINGERPRINT } : {}),
-    requiredChecks: env.REQUIRED_CHECKS ?? "",
+    requiredChecks: coverage.requiredChecks,
     reviewRoute: env.REVIEW_ROUTE ?? "",
     escalationReason: env.ESCALATION_REASON ?? "",
     cacheHitRatio: env.CACHE_HIT_RATIO ?? "",
@@ -201,6 +331,14 @@ export function publishInputFromEnv(env: NodeJS.ProcessEnv, platform: string): P
     },
     ...(env.REREVIEW_LABEL ? { rerunLabel: env.REREVIEW_LABEL } : {}),
     ...(env.VERDICT_POLICY ? { verdictPolicy: env.VERDICT_POLICY } : {}),
+    // #873: the same coverage-gap record `run` computed, read back from its
+    // persisted artifact so a partial-coverage run can never publish
+    // APPROVE through the standalone `publish` CLI path either. `unknown`
+    // (no explicit run dir, or an unreadable/unrecognizable artifact)
+    // fails closed the same way: publish must never read "I couldn't check"
+    // as "it was clean".
+    ...(coverage.partialCoverage ? { partialCoverage: coverage.partialCoverage } : {}),
+    ...(coverage.unknown ? { coverageUnknown: true } : {}),
     forgejoPositions: platform === "forgejo",
   };
 }

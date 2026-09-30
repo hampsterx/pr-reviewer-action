@@ -76,6 +76,14 @@ export interface PublishInput {
    * and the metadata marker records `coverage: partial` with the stop
    * reason. Presentation beyond this notice is #811's. */
   partialCoverage?: PartialCoverage;
+  /** #873/#838: true when the caller could not determine the tool-loop
+   * coverage state at all (the standalone `publish` CLI path: no explicit,
+   * non-empty `PR_REVIEWER_RUN_DIR`, or its harness artifact was missing or
+   * unreadable — never a fallback to the checkout). Distinct from
+   * `partialCoverage` being absent (a confirmed-complete run): this means
+   * publish could not confirm completeness, so it fails closed exactly like
+   * a confirmed gap — see `markerReviewResult`. */
+  coverageUnknown?: boolean;
   /** #847: the #810/#702 tool-loop request budget this run resolved, so the
    * size-scaled default can be measured from published reviews alone.
    * Omitted when no tool harness ran. */
@@ -98,6 +106,11 @@ const VERDICT_PREFIXES: Record<string, string> = {
   approve: "✅ **Automated recommendation: APPROVE**",
 };
 
+/** (#873) The `comment`-mode header for an approve whose coverage is
+ * incomplete: never "APPROVE", since the coverage notice right below it
+ * says the review did not finish. */
+const INCOMPLETE_COVERAGE_PREFIX = "🟡 **Automated recommendation: INCOMPLETE — not an approval**";
+
 /**
  * Sanitize model output: strip reserved metadata markers (the model can
  * never forge action-owned markers), neutralize upstream references, and
@@ -118,17 +131,40 @@ export function sanitizeForPublication(
  * entry. Under verdict_policy=strict (#811): clean / findings / partial /
  * issues from the still-open findings and required-check coverage, with a
  * #810 tool-loop coverage gap also reported as `partial`. Any other policy
- * keeps the binary clean/issues v2 consumers rely on. */
+ * keeps the binary clean/issues v2 consumers rely on for `verdict:
+ * request_changes` vs everything else, but (#873) still reports `partial`
+ * rather than `clean` when required-check coverage is incomplete or the
+ * tool loop stopped short — coverage honesty is not opt-in to a verdict
+ * policy, only the findings-driven states (findings/clean vs issues) are.
+ * `coverageUnknown` (#838: the standalone `publish` CLI could not confirm
+ * the tool-loop coverage state at all) folds into the same `partial`
+ * bucket — publish never reads "I couldn't check" as "it was clean". */
 export function markerReviewResult(input: {
   verdictPolicy?: string | undefined;
   verdict: string;
   findings?: unknown;
   requiredChecks: string;
   partialCoverage?: PartialCoverage | undefined;
+  coverageUnknown?: boolean | undefined;
 }): string {
-  if (input.verdictPolicy !== "strict") return input.verdict === "request_changes" ? "issues" : "clean";
+  const coverageGap = Boolean(input.partialCoverage) || Boolean(input.coverageUnknown);
+  const coverageIncomplete = input.requiredChecks === "incomplete" || coverageGap;
+  if (input.verdictPolicy !== "strict") {
+    if (input.verdict === "request_changes") return "issues";
+    return coverageIncomplete ? "partial" : "clean";
+  }
   const result = strictReviewResult(input.verdict, input.findings, input.requiredChecks);
-  return input.partialCoverage && result !== "issues" ? "partial" : result;
+  return coverageGap && result !== "issues" ? "partial" : result;
+}
+
+/** (#873) True when the review's own coverage signals say it did not
+ * finish: `review_result` (the marker state computed by
+ * `markerReviewResult`, above) is `partial`. This is the one gate every
+ * publish mode and every verdict policy shares — an approve can never
+ * publish as an approval while this is true, regardless of which policy
+ * or layer produced the approve. */
+export function reviewCoverageIncomplete(reviewResult: string): boolean {
+  return reviewResult === "partial";
 }
 
 /** Build the published body: marker preamble + engine line + the optional
@@ -516,6 +552,11 @@ export async function publishReview(
     // serializes byte-identically to the pre-#810 marker.
     markerContext.coverage = "partial";
     markerContext.coverageStopReason = input.partialCoverage.stop_reason;
+  } else if (input.coverageUnknown) {
+    // #873/#838: distinct from a confirmed #810 gap — the standalone
+    // `publish` CLI had no explicit run dir (or an unreadable harness) and
+    // so could not confirm coverage at all. No stop reason to report.
+    markerContext.coverage = "unknown";
   }
   const metadataMarker = buildRunMetadataMarker(markerContext);
   const markers = emitReviewMarkers((() => {
@@ -557,7 +598,14 @@ export async function publishReview(
       // #752: counts where the verdict is stated, under the strict policy.
       const counts = strict ? severityCountsLabel(input.findings) : "";
       const suffix = counts ? ` · ${counts}` : "";
-      const prefix = (VERDICT_PREFIXES[input.verdict] ?? "✅ **Automated recommendation: APPROVE**") + suffix;
+      // #873: an approve recommendation can never sit above a coverage
+      // notice saying the review isn't finished — the header would
+      // contradict the body directly below it.
+      const prefix = (
+        input.verdict === "approve" && reviewCoverageIncomplete(reviewResult)
+          ? INCOMPLETE_COVERAGE_PREFIX
+          : (VERDICT_PREFIXES[input.verdict] ?? "✅ **Automated recommendation: APPROVE**")
+      ) + suffix;
       const body = buildPublishedBody({
         markers,
         header: prefix,
@@ -606,6 +654,13 @@ export async function publishReview(
         approveForks: input.approveForks,
         isForkPr: input.isForkPr,
       });
+      // #873: coverage incompleteness withholds approval independently of
+      // the allow_approve/approve_forks guardrails and of which verdict
+      // policy produced the approve — required-check coverage incomplete,
+      // review_result=partial, or a #810 tool-loop coverage gap must never
+      // reach a GitHub/Forgejo APPROVE event.
+      const coverageIncomplete = reviewCoverageIncomplete(reviewResult);
+      const canApprove = guardrails.canApprove && !coverageIncomplete;
       let body = buildPublishedBody({
         markers,
         header: "# AI Automated Review",
@@ -617,21 +672,36 @@ export async function publishReview(
           ? renderStrictStateBlock({ requiredChecks: input.requiredChecks, findings: input.findings, linkMode: input.upstreamLinkMode })
           : undefined,
       });
-      if (!guardrails.canApprove && input.verdict === "approve") {
-        // #752: a review with open findings or a coverage gap must not call
-        // itself clean, even when its verdict is an approve.
-        const advisory = reviewResult === "clean"
-          ? "this clean review is advisory"
-          : "this review is advisory rather than a clean approval — the findings and coverage notes above are informational";
-        body += `\n> **Approval blocked by policy**: ${advisory}. Native approvals require \`allow_approve: true\` (and \`approve_forks: true\` for cross-repository PRs).\n`;
-        messages.push(
-          `Withholding native approval for #${input.prNumber} (allow_approve=${input.allowApprove}, approve_forks=${input.approveForks}, is_fork=${guardrails.isForkPr ?? input.isForkPr})`,
-        );
+      if (input.verdict === "approve" && !canApprove) {
+        if (!guardrails.canApprove) {
+          // #752: a review with open findings or a coverage gap must not
+          // call itself clean, even when its verdict is an approve.
+          const advisory = reviewResult === "clean"
+            ? "this clean review is advisory"
+            : "this review is advisory rather than a clean approval — the findings and coverage notes above are informational";
+          body += `\n> **Approval blocked by policy**: ${advisory}. Native approvals require \`allow_approve: true\` (and \`approve_forks: true\` for cross-repository PRs).\n`;
+          messages.push(
+            `Withholding native approval for #${input.prNumber} (allow_approve=${input.allowApprove}, approve_forks=${input.approveForks}, is_fork=${guardrails.isForkPr ?? input.isForkPr})`,
+          );
+        } else if (input.coverageUnknown) {
+          // #873/#838: the standalone publish path had no explicit run dir
+          // (or an unreadable harness artifact) and so could not confirm
+          // whether the tool-loop investigation finished — fail closed
+          // rather than guess it was clean.
+          body += `\n> **Approval withheld**: this review's tool-loop coverage could not be verified (no run directory was available to confirm it), so it is publishing as an advisory comment rather than an approval.\n`;
+          messages.push(`Withholding native approval for #${input.prNumber} (review coverage unknown)`);
+        } else {
+          // #873: the guardrails would allow it, but the review's own
+          // coverage signals say it did not finish — fail closed rather
+          // than publish an approval the metadata marker itself disputes.
+          body += `\n> **Approval withheld**: this review's coverage is incomplete — required-check coverage or the tool-loop investigation did not finish, so it is publishing as an advisory comment rather than an approval.\n`;
+          messages.push(`Withholding native approval for #${input.prNumber} (review coverage incomplete)`);
+        }
       }
-      const event: NativeReviewEvent = guardrails.canApprove
+      const event: NativeReviewEvent = canApprove
         ? "APPROVE"
         : input.verdict === "request_changes" ? "REQUEST_CHANGES" : "COMMENT";
-      if (guardrails.canApprove) {
+      if (canApprove) {
         messages.push(`Submitting native approval for #${input.prNumber}`);
       } else if (event === "REQUEST_CHANGES") {
         messages.push(`Submitting blocking findings for #${input.prNumber}`);
