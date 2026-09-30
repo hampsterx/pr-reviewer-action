@@ -164,6 +164,15 @@ export interface SpecialistRunInput {
     corpus: string | null;
     corpusBytes: number;
   };
+  /** #875 bounded equivalent-implementation-path hint (default off): a
+   * compact "Equivalent Paths to Compare" section appended to the
+   * CORRECTNESS role's user message only, never security/tests. Not
+   * supported in `combined_scout` (one shared message for every role) —
+   * a set `equivalentPaths` in that mode is dropped, with a warning noting
+   * the drop, matching the pre-#875 combined_scout corpus exactly. */
+  equivalentPaths?: {
+    section: string;
+  };
   /** Monotonic clock in fractional seconds; injectable for deterministic
    * tests. Defaults to `Date.now() / 1000`. */
   now?: () => number;
@@ -179,7 +188,8 @@ export interface SpecialistRunResult {
   specialistsMd: string;
   specialistLeadsPresent: string;
   /** Fail-soft advisory notices (e.g. the combined_scout→three_call
-   * adversarial downgrade); never affects the exit status. */
+   * adversarial downgrade, the dropped combined_scout equivalent-paths
+   * hint); never affects the exit status. */
   warnings: string[];
 }
 
@@ -668,6 +678,13 @@ export async function runSpecialists(input: SpecialistRunInput): Promise<Special
     const userMessage = `${USER_PREFIX}\n\n${input.corpus}`;
 
     if (execution === "combined_scout") {
+      // #875: the equivalent-paths hint is correctness-only and the scout
+      // shares ONE user message across roles, so a set hint is dropped here
+      // (matching the pre-#875 combined_scout corpus exactly); note the
+      // drop rather than failing silently.
+      if (input.equivalentPaths?.section) {
+        warnings.push("equivalent-paths hint is incompatible with DEEP_REVIEW_EXECUTION=combined_scout; dropping it");
+      }
       const scout = await runSpecialistScout(
         input.rolesToRun,
         userMessage,
@@ -701,7 +718,13 @@ export async function runSpecialists(input: SpecialistRunInput): Promise<Special
         // security/tests always see the standard corpus and the default
         // prompt.
         const useAdversarial = role === "correctness" && adversarialActive;
-        const roleUserMessage = useAdversarial ? `${USER_PREFIX}\n\n${input.adversarial!.corpus}` : userMessage;
+        let roleUserMessage = useAdversarial ? `${USER_PREFIX}\n\n${input.adversarial!.corpus}` : userMessage;
+        // #875: append the bounded "Equivalent Paths to Compare" hint to the
+        // correctness role only, after the corpus (blinded or standard) so
+        // it reads as one more section rather than replacing anything.
+        if (role === "correctness" && input.equivalentPaths?.section) {
+          roleUserMessage = `${roleUserMessage}\n\n${input.equivalentPaths.section}`;
+        }
         roleWork.set(
           role,
           runSpecialistRole({

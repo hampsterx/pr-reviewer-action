@@ -20,8 +20,25 @@ test("current canonical contract validates and maps every input once", () => {
     assert.ok(Object.hasOwn(config, toCamelCase(input.id)), input.id);
     assert.equal(toCamelCase(input.id).includes("_"), false);
   }
-  assert.equal(contract.inputs.length, 126);
+  assert.equal(contract.inputs.length, 128);
   assert.equal(Object.hasOwn(config, "ai_base_url"), false);
+});
+
+test("#875: equivalent-paths-max-bytes is a positive integer — zero and negative are rejected", () => {
+  // Matches related-code-max-bytes: 0 must not silently fall back to the
+  // 6000 default, and a negative value must not reach the clipping helper
+  // (which would reject it and leave the hint empty).
+  const required = Object.fromEntries(contract.inputs.filter((input) => input.required).map((input) => [input.id, `required-${input.id}`]));
+  for (const bad of ["0", "-1"]) {
+    assert.throws(
+      () => loadConfig(contract, { ...required, "equivalent-paths-max-bytes": bad }),
+      (e: unknown) => e instanceof Error && e.message === "Input 'equivalent-paths-max-bytes' must be at least 1",
+      bad,
+    );
+  }
+  // Unset keeps the contract default.
+  const config = loadConfig(contract, required);
+  assert.equal(config.equivalentPathsMaxBytes, 6000);
 });
 
 test("contract defaults and typed parsing agree for every input", () => {
