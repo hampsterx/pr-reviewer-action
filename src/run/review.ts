@@ -8,7 +8,7 @@ import { resolveTierBudgets } from "../corpus/budgets.js";
 import { prioritizeDiff } from "../corpus/diff-priority.js";
 import { truncateClean } from "../corpus/truncate.js";
 import { readFileSync, appendFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { canonicalChangedFile, normalizeLinkedIssues } from "../context/types.js";
 import { pythonJsonStringify } from "../precheck/metadata.js";
 import { buildHarnessObligations } from "../requirements/obligations.js";
@@ -46,7 +46,7 @@ import { renderClaimsSection } from "../claims/render.js";
 import { buildModelRequest } from "../model/request.js";
 import { callModelTier, type TierProfile } from "../model/call.js";
 import { parseVerdictResponse } from "../model/verdict.js";
-import { annotateAnalysisEngine, analysisEngineBase, buildUserMessage, handleModelFailure, MODEL_UNAVAILABLE_ENGINE, publicAnalysisEngine, applySystemPromptFragments, applySpecialistLeadsFragment, applySupersededDiscussionFragment, applyRequirementTraceFragment, resolveSystemPrompt } from "../prompt/index.js";
+import { annotateAnalysisEngine, analysisEngineBase, buildUserMessage, handleModelFailure, MODEL_UNAVAILABLE_ENGINE, publicAnalysisEngine, applySystemPromptFragments, applySpecialistLeadsFragment, applySupersededDiscussionFragment, applyRequirementTraceFragment, resolveSystemPrompt, workspaceAt, type PromptWorkspace } from "../prompt/index.js";
 import { reviewArtifactFromParsed } from "../enforcement/artifact.js";
 import { applyStrictVerdictPolicy, applyVerdictPolicy } from "../enforcement/verdict-policy.js";
 import { markerReviewResult } from "../publish/publish.js";
@@ -364,7 +364,7 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
       ...(env.SYSTEM_PROMPT_FILE !== undefined ? { systemPromptFile: env.SYSTEM_PROMPT_FILE } : {}),
       ...(env.SYSTEM_PROMPT_MODE !== undefined ? { systemPromptMode: env.SYSTEM_PROMPT_MODE } : {}),
     },
-    ws,
+    promptFileWorkspace(workspace, baseRef),
   );
   log(`Analyzing #${prNumber} in ${repo} with ${env.AI_MODEL} using ${env.AI_API_FORMAT} API format...`);
 
@@ -1178,6 +1178,34 @@ function gateForkForForks(env: StageEnv, forkFlag: string): { md: string; json: 
  * base ref, or when the base-ref read fails for an infrastructure reason
  * (git missing, timeout), the result is no standards plus a warning — never
  * a fallback to the checked-out working tree. */
+/** #904: `SYSTEM_PROMPT_FILE` is a repository path, read from the trusted base
+ * ref like the standards file (#885) so a PR can't rewrite the prompt that
+ * reviews it. An absolute operator path is read from disk; with no base ref
+ * the checkout is used. Never the run's artifact directory. */
+function promptFileWorkspace(workspace: string, baseRef: string): PromptWorkspace {
+  const checkout = workspaceAt(workspace);
+  if (baseRef === "") return checkout;
+  const cache = new Map<string, Buffer | null>();
+  const read = (path: string): Buffer | null => {
+    if (!cache.has(path)) {
+      let content: Buffer | null = null;
+      try {
+        const bytes = readStandardsFileAtRef({ standardsFile: path, candidates: "", ref: baseRef, workspace }).content;
+        content = bytes === null ? null : Buffer.from(bytes);
+      } catch {
+        content = null;
+      }
+      cache.set(path, content);
+    }
+    return cache.get(path) ?? null;
+  };
+  return {
+    isFile: (path) => (isAbsolute(path) ? checkout.isFile(path) : read(path) !== null),
+    isNonEmpty: (path) => (isAbsolute(path) ? checkout.isNonEmpty(path) : (read(path)?.length ?? 0) > 0),
+    readBytes: (path) => (isAbsolute(path) ? checkout.readBytes(path) : read(path)),
+  };
+}
+
 function resolveStandards(
   env: StageEnv,
   workspace: string,
