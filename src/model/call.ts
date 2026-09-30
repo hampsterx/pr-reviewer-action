@@ -26,7 +26,11 @@ import { describeTransportFailure, TransportFailure } from "../transport/http.js
  *   fallback. The one-shot non-streamed verdict retry is a separate entry
  *   point (`produceVerdict`) mirroring the native-loop verdict path
  *   (`produce_native_verdict` in run_tool_harness.py), the only v2 place
- *   that does it.
+ *   that does it;
+ * - every tier always makes at least one attempt (#867), regardless of a
+ *   configured `retries` of 0: `retries` is the total-attempt budget, and
+ *   skipping the call entirely for a degenerate 0 would misreport a real
+ *   transport outage as the loop's synthetic default parse failure below.
  */
 
 export const EMPTY_COMPLETION_EXIT = 3;
@@ -105,7 +109,15 @@ export async function callModelTier(
   let lastParseFailure: VerdictParseFailure | null = null;
   let lastTransportFailure: TransportFailure | null = null;
 
-  while (attempt <= profile.retries) {
+  // #867: `retries` is a total-attempt budget (attempt <= retries), but a
+  // caller-configured 0 (accepted by schema validation: ai-primary-retries
+  // must only be >= 0) must never mean "never call the model at all" — that
+  // silently skipped the request entirely and fell through to the synthetic
+  // default below, misreporting a real endpoint outage as a fabricated
+  // parse/validate failure instead of a transport one. At least one attempt
+  // always runs; `retries` still governs every attempt after the first.
+  const totalAttempts = Math.max(1, profile.retries);
+  while (attempt <= totalAttempts) {
     const payload = buildModelRequest(requestConfig(profile, context, profile.stream));
     const outcome = await doCall({
       baseUrl: profile.baseUrl,
@@ -119,11 +131,15 @@ export async function callModelTier(
 
     if (outcome.status === "failure") {
       // Transport or HTTP error: consume the retry budget with doubling
-      // backoff, capped at 120 s.
+      // backoff, capped at 120 s. Only sleep/back off when another attempt
+      // is actually coming — a final failed attempt (no budget left) must
+      // never pay the retry delay for a retry that will never happen.
       lastTransportFailure = outcome.failure;
       attempt++;
-      await sleep(delay);
-      delay = Math.min(delay * 2, MAX_RETRY_DELAY_SEC);
+      if (attempt <= totalAttempts) {
+        await sleep(delay);
+        delay = Math.min(delay * 2, MAX_RETRY_DELAY_SEC);
+      }
       continue;
     }
 
@@ -143,7 +159,9 @@ export async function callModelTier(
         return { status: "parse_exhausted", attempts: attempt, failure: error };
       }
       attempt++;
-      await sleep(delay);
+      // Same rule as the transport branch: only sleep when a further
+      // attempt is actually going to run.
+      if (attempt <= totalAttempts) await sleep(delay);
     }
   }
   return lastTransportFailure
