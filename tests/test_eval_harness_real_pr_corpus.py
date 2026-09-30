@@ -20,7 +20,6 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import eval_harness
 from eval_harness import (
     RealPRCorpus,
     RealPRDefect,
@@ -514,7 +513,7 @@ class TestPreparePinnedWorkspace:
 
     def test_manifest_derivation_failure_fails_the_prepare(self, tmp_path, monkeypatch):
         repo, base, head = self._repo(tmp_path)
-        monkeypatch.setattr(eval_harness, "_files_from_pinned_diff", lambda *_a, **_k: None)
+        monkeypatch.setattr("eval_harness._files_from_pinned_diff", lambda *_a, **_k: None)
         ok, err = _prepare_pinned_workspace(repo, head, base)
         assert not ok
         assert "manifest" in err
