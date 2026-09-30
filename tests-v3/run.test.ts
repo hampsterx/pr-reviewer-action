@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { runReview } from "../src/run/review.js";
-import { authoritativeBodyRevision, type PrBodyRevision } from "../src/run/stages.js";
+import { authoritativeBodyRevision, harnessTransportAdapter, type PrBodyRevision } from "../src/run/stages.js";
+import type { StageEnv } from "../src/run/env.js";
 import { forkGate } from "../src/gates/gates.js";
 import { startMockServer } from "./helpers.js";
 import type { PlatformReadAdapter } from "../src/platform/types.js";
@@ -1606,5 +1607,145 @@ test("#833: no seed file falls back to the live PR file list and totals", async 
   } finally {
     await server.close();
     cleanup();
+  }
+});
+
+test("#846: primary HTTP errors carry status, a redacted body excerpt, and the 404 hint into the error log", async () => {
+  const planted = "ghp_" + "a".repeat(36); // matches redactText's GitHub PAT pattern
+  const apiKey = "primary-secret-key-value";
+  let call = 0;
+  const server = await startMockServer((_req, _body, res) => {
+    call += 1;
+    if (call === 1) {
+      res.statusCode = 429;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: { message: "rate limited, back off" } }));
+      return;
+    }
+    res.statusCode = 404;
+    res.setHeader("Content-Type", "application/json");
+    // The provider echoes both a PAT-shaped planted secret AND the literal
+    // configured API key bare (no "key="/"Bearer " framing that redactText's
+    // heuristics look for) — only explicit known-secret masking (#846
+    // security review) catches the latter.
+    res.end(JSON.stringify({ error: { message: `no route for this model; leaked token ${planted}; credential ${apiKey} rejected` } }));
+  });
+  const { runDir, cleanup } = withRunDir();
+  const errors: string[] = [];
+  try {
+    // on-model-failure=fail (explicit, since the action default is now
+    // "notice" per #863/#866): runReview rejects once the primary (no
+    // fallback configured) exhausts its retries, but the transport error
+    // line is logged synchronously before that throw.
+    await assert.rejects(() => runReview({
+      env: {},
+      inputs: {
+        "github-token": "tok",
+        repo: "o/r",
+        "pr-number": "7",
+        "ai-base-url": server.url,
+        "ai-model": "m",
+        "ai-stream": "false",
+        "ai-api-key": apiKey,
+        "ai-primary-retries": "2",
+        "ai-primary-retry-delay-sec": "0",
+        "on-model-failure": "fail",
+      },
+      runDir,
+      workspace: runDir,
+      platformAdapter: mockPlatform(),
+      sleep: async () => {},
+      error: (line) => errors.push(line),
+      quiet: true,
+    }));
+    assert.ok(call >= 2, `expected at least one retry, got ${call} call(s)`);
+    const failureLine = errors.find((line) => line.includes("transport failures exhausted"));
+    assert.ok(failureLine, `expected a transport-exhausted error line, got: ${JSON.stringify(errors)}`);
+    assert.match(failureLine!, /HTTP 404/);
+    assert.match(failureLine!, /no route for this model/);
+    assert.match(failureLine!, /check ai-api-format for this model \(openai vs anthropic\)/);
+    assert.ok(!failureLine!.includes(planted), "the planted secret must not appear in the error log");
+    assert.ok(!failureLine!.includes(apiKey), "the configured API key must not appear in the error log");
+
+    const responseArtifact = JSON.parse(readFileSync(join(runDir, "ai-response.primary.json"), "utf8")) as Record<string, unknown>;
+    assert.match(String(responseArtifact.error), /HTTP 404/);
+    assert.ok(!String(responseArtifact.error).includes(planted));
+    assert.ok(!String(responseArtifact.error).includes(apiKey), "the configured API key must not appear in the persisted response artifact");
+
+    for (const line of errors) {
+      assert.ok(!line.includes(apiKey), "the configured API key must never appear anywhere in logs");
+    }
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test("#846 security review: harnessTransportAdapter masks the configured API key out of its thrown transport-failure message", async () => {
+  const apiKey = "harness-secret-key-value";
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 404;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ error: { message: `no route for this model; credential ${apiKey} rejected` } }));
+  });
+  try {
+    const transport = harnessTransportAdapter({} as StageEnv);
+    await assert.rejects(
+      () => transport(server.url, "openai", { model: "m", stream: false, messages: [] }, apiKey, 5),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /HTTP 404/);
+        assert.match(error.message, /check ai-api-format for this model \(openai vs anthropic\)/);
+        assert.ok(!error.message.includes(apiKey), `expected the configured API key to be masked, got: ${error.message}`);
+        return true;
+      },
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("#846 security review: a one-character or three-character configured API key is masked in the primary error log and artifact", async () => {
+  for (const apiKey of ["k", "abc"]) {
+    const server = await startMockServer((_req, _body, res) => {
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: { message: `no route for this model; credential ${apiKey} rejected` } }));
+    });
+    const { runDir, cleanup } = withRunDir();
+    const errors: string[] = [];
+    try {
+      await assert.rejects(() => runReview({
+        env: {},
+        inputs: {
+          "github-token": "tok",
+          repo: "o/r",
+          "pr-number": "7",
+          "ai-base-url": server.url,
+          "ai-model": "m",
+          "ai-stream": "false",
+          "ai-api-key": apiKey,
+          "ai-primary-retries": "1",
+          "ai-primary-retry-delay-sec": "0",
+          "on-model-failure": "fail",
+        },
+        runDir,
+        workspace: runDir,
+        platformAdapter: mockPlatform(),
+        sleep: async () => {},
+        error: (line) => errors.push(line),
+        quiet: true,
+      }));
+      const failureLine = errors.find((line) => line.includes("transport failures exhausted"));
+      assert.ok(failureLine, `apiKey=${JSON.stringify(apiKey)}: expected a transport-exhausted error line, got: ${JSON.stringify(errors)}`);
+      for (const line of errors) {
+        assert.ok(!line.includes(apiKey), `apiKey=${JSON.stringify(apiKey)} must not appear in error log line: ${line}`);
+      }
+      const responseArtifact = JSON.parse(readFileSync(join(runDir, "ai-response.primary.json"), "utf8")) as Record<string, unknown>;
+      assert.ok(!String(responseArtifact.error).includes(apiKey), `apiKey=${JSON.stringify(apiKey)} must not appear in the persisted response artifact`);
+    } finally {
+      await server.close();
+      cleanup();
+    }
   }
 });

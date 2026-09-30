@@ -2,6 +2,7 @@ import http from "node:http";
 import https from "node:https";
 import { URL } from "node:url";
 import type { ApiFormat } from "../model/types.js";
+import { maskKnownSecrets, redactText } from "../context/redact.js";
 
 /**
  * Typed HTTP transport for model calls (#677). Replaces the v2 curl/jq wire
@@ -101,6 +102,52 @@ export class TransportFailure extends Error {
     if (options.maxResponseBytes !== undefined) this.maxResponseBytes = options.maxResponseBytes;
     if (options.bytesReceived !== undefined) this.bytesReceived = options.bytesReceived;
   }
+}
+
+/** #846: a 404 from the completions/messages path is most often a wrong
+ * `ai-api-format` (routed to an endpoint that doesn't serve the requested
+ * API shape) rather than a dead endpoint — point at the fix instead of
+ * leaving the operator to guess from a bare status code. */
+const API_FORMAT_404_HINT = "check ai-api-format for this model (openai vs anthropic)";
+
+export interface DescribeTransportFailureOptions {
+  maxBodyChars?: number;
+  /** The operator-configured model API key(s) relevant to this call (e.g.
+   * the tier's `profile.apiKey`) — masked unconditionally, in addition to
+   * (and before) `redactText`'s heuristics, since a provider echoing the
+   * literal key in prose (no `key=`/`Bearer ` framing) would otherwise pass
+   * every heuristic pattern untouched. See `maskKnownSecrets`. */
+  secrets?: readonly (string | null | undefined)[];
+}
+
+/**
+ * A short, secret-redacted, length-capped detail string for a
+ * `TransportFailure`, suitable for logs and error telemetry (#846):
+ * `HTTP <status>: <redacted body excerpt>`, with the #846 hint appended on a
+ * 404. Falls back to the bare `.message` for failure kinds that carry no
+ * status/body (connect/request timeouts, network errors) — there is nothing
+ * to excerpt there; `secrets` is still masked out of `.message` in that case.
+ */
+export function describeTransportFailure(failure: TransportFailure, options: DescribeTransportFailureOptions | number = {}): string {
+  // Backward-compatible with the original `(failure, maxBodyChars)` shape.
+  const resolved: DescribeTransportFailureOptions = typeof options === "number" ? { maxBodyChars: options } : options;
+  const maxBodyChars = resolved.maxBodyChars ?? 300;
+  const secrets = resolved.secrets ?? [];
+  if (failure.status === undefined) return maskKnownSecrets(failure.message, secrets);
+  // Known secrets are masked first, on the full untruncated body, so a
+  // secret split across the truncation boundary is never partially exposed.
+  const withoutKnownSecrets = maskKnownSecrets((failure.body ?? "").trim(), secrets);
+  const redacted = redactText(withoutKnownSecrets);
+  const points = Array.from(redacted);
+  const body = points.length > maxBodyChars ? `${points.slice(0, maxBodyChars).join("")}...[truncated]` : redacted;
+  const hint = failure.status === 404 ? ` — ${API_FORMAT_404_HINT}` : "";
+  // A second, whole-string mask pass: a very short configured key (down to
+  // one character, since ai-api-key has no minimum length) can coincide
+  // with ordinary letters in the static "HTTP <status>"/hint text (e.g. the
+  // 'k' in "check"), which the body-only pass above never touches.
+  // Over-redacting a few incidental letters is an acceptable cost next to
+  // ever leaking the credential.
+  return maskKnownSecrets(`HTTP ${failure.status}${body ? `: ${body}` : ""}${hint}`, secrets);
 }
 
 function oversizeFailure(
