@@ -360,10 +360,21 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
   const generatedPaths = await generatedAttributePaths(workspace, diffText, budgets.primary.maxDiff);
   ws.write("pr.diff.truncated", prioritizeDiff(Buffer.from(diffText, "utf8"), budgets.primary.maxDiff, { generated: generatedPaths }));
 
-  const seededFiles = safeJsonArray(ws.read("pr-files.seed.json"));
+  const seedBytes = ws.read("pr-files.seed.json");
   let rawFilesList: unknown[];
   let totalChangedFiles: number;
-  if (seededFiles !== null) {
+  if (seedBytes !== null) {
+    // #833/#835: the file manifest is part of a pinned replay's identity — a
+    // present-but-unusable seed (unparsable, not an array, or an entry
+    // without a string filename; a zero-byte file included) must never fall
+    // back to the live list, which would silently reintroduce the bug this
+    // seam fixes. Absence alone (no seed at all) is the unchanged production
+    // path below.
+    const seededFiles = seedBytes.length > 0 ? safeJsonArray(seedBytes) : null;
+    const seedValid = seededFiles !== null && seededFiles.every(
+      (file) => typeof file === "object" && file !== null && typeof (file as Record<string, unknown>).filename === "string",
+    );
+    if (!seedValid) throw new RunReviewError("pr-files.seed.json is present but malformed (expected a JSON array of file objects with a string filename)");
     log("Reusing PR file list derived from the pinned diff");
     rawFilesList = seededFiles;
     const totals = seededFileTotals(rawFilesList);

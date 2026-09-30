@@ -1717,7 +1717,10 @@ def _prepare_pinned_workspace(
     it was at that head rather than the PR's current state, and seeds
     ``pr-files.seed.json`` with that same diff's file manifest so the runtime's
     file list and size totals match the diff instead of the PR's live,
-    possibly-since-changed file list. Returns (ok, error).
+    possibly-since-changed file list. The manifest is part of the pinned
+    replay's identity, not best-effort: a manifest derivation failure fails
+    the whole prepare, exactly like a diff failure, rather than leaving the
+    review to fall back to the live file list. Returns (ok, error).
     """
     result = subprocess.run(
         ["git", "-C", str(repo_path), "clean", "-ffdxq"],
@@ -1743,8 +1746,9 @@ def _prepare_pinned_workspace(
         return False, f"diff {base_sha[:12]}...{head_sha[:12]} failed: {result.stderr[:300]}"
     (repo_path / "pr.diff").write_text(result.stdout, encoding="utf-8")
     files_json = _files_from_pinned_diff(repo_path, base_sha, head_sha)
-    if files_json is not None:
-        (repo_path / "pr-files.seed.json").write_text(files_json, encoding="utf-8")
+    if files_json is None:
+        return False, f"file manifest {base_sha[:12]}...{head_sha[:12]} could not be derived"
+    (repo_path / "pr-files.seed.json").write_text(files_json, encoding="utf-8")
     return True, ""
 
 
