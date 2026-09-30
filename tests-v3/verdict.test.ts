@@ -240,6 +240,115 @@ test("stream/endpoint errors are surfaced with the v2 message", () => {
   assert.throws(() => parseVerdictResponse({ error: "boom" }), /Model endpoint returned an error: boom/);
 });
 
+test("#868: an in-body error echoing the configured key is masked", () => {
+  const configuredKey = "sk-real-configured-secret-abc123";
+  const patShaped = "ghp_" + "a".repeat(36);
+  assert.throws(
+    () =>
+      parseVerdictResponse(
+        { error: { message: `invalid key ${configuredKey} (also saw ${patShaped})` } },
+        [configuredKey],
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof VerdictParseFailure);
+      assert.equal(error.kind, "endpoint_error");
+      assert.ok(!error.message.includes(configuredKey), error.message);
+      assert.ok(!error.message.includes(patShaped), error.message);
+      assert.match(error.message, /\[REDACTED\]/);
+      return true;
+    },
+  );
+});
+
+test("#868: an in-body error is masked even with no secrets threaded in (redactText still applies)", () => {
+  const patShaped = "ghp_" + "b".repeat(36);
+  assert.throws(
+    () => parseVerdictResponse({ error: { message: `token leaked: ${patShaped}` } }),
+    (error: unknown) => {
+      assert.ok(error instanceof VerdictParseFailure);
+      assert.ok(!error.message.includes(patShaped), error.message);
+      return true;
+    },
+  );
+});
+
+test("#868: a one-character configured key is masked everywhere it occurs, including in the static 'Model endpoint returned an error: ' prefix", () => {
+  // ai-api-key has no configured minimum length (#862's precedent for
+  // describeTransportFailure); a one-character key can coincide with
+  // ordinary letters in surfaceStreamError's own static prefix text, which
+  // only a whole-string second mask pass (not just masking the raw body
+  // message) can catch. "e" appears in "endpoint"/"error" in the prefix.
+  assert.throws(
+    () => parseVerdictResponse({ error: { message: "credential rejected" } }, ["e"]),
+    (error: unknown) => {
+      assert.ok(error instanceof VerdictParseFailure);
+      // Every literal "e" is gone — including from the static prefix —
+      // while the uppercase "E" inside "[REDACTED]" is untouched.
+      assert.ok(!error.message.includes("e"), `expected every "e" to be masked, got: ${error.message}`);
+      assert.match(error.message, /\[REDACTED\]/);
+      return true;
+    },
+  );
+});
+
+test("#868: an oversized in-body error message is capped at 300 chars, mirroring #862", () => {
+  const huge = "x".repeat(1000);
+  assert.throws(
+    () => parseVerdictResponse({ error: { message: huge } }),
+    (error: unknown) => {
+      assert.ok(error instanceof VerdictParseFailure);
+      assert.ok(error.message.length < 400, `expected a capped message, got ${error.message.length} chars`);
+      assert.ok(error.message.includes("...[truncated]"));
+      return true;
+    },
+  );
+});
+
+test("#868 maintainer follow-up: EVERY VerdictParseFailure kind is masked, not just endpoint_error", () => {
+  const configuredKey = "sk-real-configured-secret-for-every-kind";
+  // invalid_verdict: "Expected verdict to be ... got '<model-controlled value>'"
+  // is exactly the kind the maintainer flagged as unmasked before this fix —
+  // a 200 completion that parses fine but echoes the configured key as the
+  // verdict value itself.
+  assert.throws(
+    () => parseVerdictResponse(openaiResponse(JSON.stringify({ verdict: configuredKey, review_markdown: "x" })), [configuredKey]),
+    (error: unknown) => {
+      assert.ok(error instanceof VerdictParseFailure);
+      assert.equal(error.kind, "invalid_verdict");
+      assert.ok(!error.message.includes(configuredKey), `invalid_verdict leaked the key: ${error.message}`);
+      assert.match(error.message, /\[REDACTED\]/);
+      return true;
+    },
+  );
+  // Same regression, a one-character key. (Deliberately not one of
+  // "REDACTED"'s own letters: masking a secret that coincides with a
+  // character inside the "[REDACTED]" marker itself is a separate,
+  // pathological property of substring masking — every pass that inserts a
+  // fresh marker introduces new copies of that letter — and is exercised on
+  // its own below, not conflated with this regression.)
+  assert.throws(
+    () => parseVerdictResponse(openaiResponse(JSON.stringify({ verdict: "k", review_markdown: "x" })), ["k"]),
+    (error: unknown) => {
+      assert.ok(error instanceof VerdictParseFailure);
+      assert.equal(error.kind, "invalid_verdict");
+      assert.ok(!error.message.includes("k"), `invalid_verdict leaked the one-character key: ${error.message}`);
+      return true;
+    },
+  );
+  // missing_verdict_key: no model-controlled value embedded, but still runs
+  // through the same boundary — a configured key that happens to be a
+  // common short word/letter sequence must not survive incidentally either.
+  assert.throws(
+    () => parseVerdictResponse(openaiResponse(JSON.stringify({ notes: "x" })), ["key"]),
+    (error: unknown) => {
+      assert.ok(error instanceof VerdictParseFailure);
+      assert.equal(error.kind, "missing_verdict_key");
+      assert.ok(!error.message.includes("key"), `missing_verdict_key leaked the configured key: ${error.message}`);
+      return true;
+    },
+  );
+});
+
 test("non-object payloads fail with the v2 message", () => {
   assert.throws(() => parseVerdictResponse(openaiResponse("[1,2,3]")), (error: unknown) => {
     assert.ok(error instanceof VerdictParseFailure);

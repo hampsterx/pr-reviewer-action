@@ -1,5 +1,6 @@
 import type { NormalizedFinding, NormalizedHumanReviewDisposition, NormalizedRequiredCheckDisposition, NormalizedThreadDisposition, ParsedReviewVerdict, RequiredCheckStatus, VerdictValue } from "./types.js";
 import { VerdictParseFailure } from "./types.js";
+import { maskDiagnostic } from "../context/redact.js";
 
 /**
  * Port of pr_reviewer/response_parser.py: tolerant model-output parsing and
@@ -487,6 +488,13 @@ function completionTokens(response: Record<string, unknown>): number | null {
   return null;
 }
 
+/**
+ * A 200 reply whose body carries an error object (`{"error": ...}`, common
+ * on OpenAI-compatible proxies and mid-stream SSE failures). Builds the raw,
+ * unmasked message — `parseVerdictResponse`'s outer boundary masks every
+ * `VerdictParseFailure` it throws (this one included) before it can reach a
+ * caller, so there is no masking to do here.
+ */
 function surfaceStreamError(response: Record<string, unknown>): void {
   const err = response.error;
   if (!err) return;
@@ -560,9 +568,11 @@ export interface ParsedResponse {
 /**
  * Parse a raw model response (already deserialized JSON) into a validated
  * review verdict. Throws VerdictParseFailure on any validation failure, with
- * v2-identical messages.
+ * v2-identical messages — before masking (see `parseVerdictResponse` below,
+ * the exported entry point, which is the ONE place every such message gets
+ * masked before a caller ever sees it).
  */
-export function parseVerdictResponse(response: unknown): ParsedReviewVerdict {
+function parseVerdictResponseUnmasked(response: unknown): ParsedReviewVerdict {
   if (!isRecord(response)) {
     throw new VerdictParseFailure("not_object", `Expected JSON object but got ${pyTypeName(response)}`);
   }
@@ -669,4 +679,29 @@ export function parseVerdictResponse(response: unknown): ParsedReviewVerdict {
     smartReviewReason: smartRequest.reason,
     extra,
   };
+}
+
+/**
+ * Parse a raw model response (already deserialized JSON) into a validated
+ * review verdict — the exported entry point, and the ONE masking boundary
+ * for every failure kind `parseVerdictResponseUnmasked` can throw (#868):
+ * an in-body error (`endpoint_error`), but just as much an `invalid_verdict`
+ * ("got '<model-controlled value>'"), a flattened-markdown notice, or any
+ * other kind whose v2-parity message embeds text the parser itself has no
+ * control over. `secrets` (the operator-configured model API key(s) for
+ * this call, if known to the caller) is masked into the message via
+ * `maskDiagnostic` — `kind`/`truncated` (and the `emptyCompletion` it
+ * derives) are preserved so every caller's failure-kind branching is
+ * unaffected. Callers with no key in scope (e.g. the parity harness) may
+ * omit `secrets`; the v2-parity message text is untouched in that case.
+ */
+export function parseVerdictResponse(response: unknown, secrets: readonly (string | null | undefined)[] = []): ParsedReviewVerdict {
+  try {
+    return parseVerdictResponseUnmasked(response);
+  } catch (error) {
+    if (error instanceof VerdictParseFailure) {
+      throw new VerdictParseFailure(error.kind, maskDiagnostic(error.message, secrets), { truncated: error.truncated });
+    }
+    throw error;
+  }
 }
