@@ -230,6 +230,14 @@ byte-identically to the pre-#810 marker; the #680 `metadata-markers` parity
 fixtures need no divergence because they never set coverage. Presentation
 beyond the notice (e.g. demoting clean approves) is #811's.
 
+## New inputs
+
+Inputs with no v2 implementation.
+
+| v3 input | Default |
+| --- | --- |
+| `harness-obligations` | `false` |
+
 ## Retained outputs
 
 | v2 output | v3 output |
@@ -1009,9 +1017,13 @@ The ledger sha covers them (they are ledger entries like any other), the
 strict requirement-coverage fold and evidence-gated normalizer are unchanged,
 and the verdict remains the reviewer's. The requirement-ledger prompt
 fragment adds one rule: a `violated` obligation must come with a finding.
-Pending merge gate: the human-findings corpus measurement (ledger-on vs
-off, 3 runs per PR per arm) must be recorded before the injection ships
-enabled in production.
+The injection is opt-in (`harness-obligations: true`, default `false`). On
+the 37 human-findings PRs where an obligation names the defect file (3 runs
+per PR per arm, one model, findings adjudicated blind), it showed no recall
+gain and no false-positive improvement: the human defect was caught in 21.6%
+of runs on vs 24.3% off (paired delta -2.7pp, 95% CI -12.6 to +7.2), with
+0.42 vs 0.39 blocker/major false positives per run. Evidence:
+`evals/reports/harness-obligations/`.
 
 ## Workflow examples
 
