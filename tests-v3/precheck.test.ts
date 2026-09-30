@@ -186,9 +186,93 @@ test("metadata markers parse and drive the carried verdict", () => {
 test("linked issue refs extract, dedupe, and cap", () => {
   const refs = extractLinkedIssueRefs("Fixes #1, closes other/repo#2, fixes #1, RESOLVES: #3", "o/r");
   assert.deepEqual(refs.map((ref) => ref.ref), ["#1", "other/repo#2", "#3"]);
+  assert.ok(refs.every((ref) => ref.closing));
   assert.equal(extractLinkedIssueRefs("Fixes #1", "o/r")[0]!.repo, "o/r");
   assert.deepEqual(labelsOf({ labels: [{ name: " b " }, "c", {}, { name: "" }] }), ["b", "c"]);
   assert.deepEqual(labelsOf({ labels: [] }), []);
+});
+
+test("linked issue refs: title (#N) / (owner/repo#N) convention (#872)", () => {
+  const bare = extractLinkedIssueRefs("body text", "o/r", "feat(v3): add thing (#584)");
+  assert.deepEqual(bare.map((ref) => ref.ref), ["#584"]);
+  assert.equal(bare[0]!.repo, "o/r");
+  assert.equal(bare[0]!.closing, false);
+
+  const scoped = extractLinkedIssueRefs("body text", "o/r", "feat: add thing (other/repo#584)");
+  assert.deepEqual(scoped.map((ref) => ref.ref), ["other/repo#584"]);
+  assert.equal(scoped[0]!.repo, "other/repo");
+  assert.equal(scoped[0]!.closing, false);
+
+  assert.deepEqual(
+    extractLinkedIssueRefs("body text", "o/r", "feat: add thing (#123) more text"),
+    [],
+    "(#N) not at the end of the title must not match",
+  );
+  assert.deepEqual(extractLinkedIssueRefs("body text", "o/r", "feat: no ref here"), []);
+});
+
+test("linked issue refs: non-closing body implementation references (#872)", () => {
+  for (const body of ["Implements #10", "Part of #10", "Refs #10", "Ref #10"]) {
+    const refs = extractLinkedIssueRefs(body, "o/r");
+    assert.deepEqual(refs.map((ref) => ref.ref), ["#10"], body);
+    assert.equal(refs[0]!.closing, false, body);
+  }
+});
+
+test("linked issue refs: incidental mentions are never linked (#872)", () => {
+  assert.deepEqual(extractLinkedIssueRefs("depends on #583", "o/r"), []);
+  assert.deepEqual(extractLinkedIssueRefs("see #12 for background", "o/r"), []);
+  assert.deepEqual(extractLinkedIssueRefs("Related to #12", "o/r"), [], "ambiguous form stays unlinked");
+});
+
+test("linked issue refs: title and body forms combine, deduped, capped at 8", () => {
+  const refs = extractLinkedIssueRefs("Implements #584\nRefs #7", "o/r", "feat: thing (#584)");
+  assert.deepEqual(refs.map((ref) => ref.ref), ["#584", "#7"], "title ref deduped against body ref");
+});
+
+test("linked issue refs: a later closing occurrence upgrades an earlier non-closing dedupe entry", () => {
+  // Regression: a title `(#N)` convention is non-closing; if the body ALSO
+  // closes the same issue, the merged entry must end up closing:true — the
+  // ref must not stay stuck at whichever form was seen first.
+  const refs = extractLinkedIssueRefs("Closes #584", "o/r", "feat: thing (#584)");
+  assert.deepEqual(refs.map((ref) => ref.ref), ["#584"], "still one merged entry, in first-occurrence order");
+  assert.equal(refs[0]!.closing, true, "the later closing keyword upgrades the entry");
+
+  // The reverse order (closing keyword first, non-closing form second) must
+  // never downgrade an already-closing entry.
+  const reordered = extractLinkedIssueRefs("Refs #9\nCloses #9", "o/r");
+  assert.equal(reordered.length, 1);
+  assert.equal(reordered[0]!.closing, true);
+});
+
+test("linked issue refs: dedupe/merge is by canonical identity (bare #N resolved through defaultRepo, case-insensitive), not raw spelling", () => {
+  // Regression: title `(#584)` (bare, resolves to o/r#584 via defaultRepo)
+  // and body `Closes o/r#584` (explicit, same repo) name the SAME issue —
+  // they must merge into one entry, not two, with the merge still upgrading
+  // to closing:true and keeping the first-occurrence spelling (the title's).
+  const merged = extractLinkedIssueRefs("Closes o/r#584", "o/r", "feat: thing (#584)");
+  assert.deepEqual(merged.map((ref) => ({ ref: ref.ref, repo: ref.repo, number: ref.number })), [
+    { ref: "#584", repo: "o/r", number: 584 },
+  ], "one merged entry, keeping the title's bare spelling (first occurrence)");
+  assert.equal(merged[0]!.closing, true);
+
+  // Reverse spelling assignment: the explicit form appears first (title),
+  // the bare form second (body) — must still merge into one entry, keeping
+  // the title's (now explicit) spelling.
+  const reversedSpelling = extractLinkedIssueRefs("Closes #584", "o/r", "feat: thing (o/r#584)");
+  assert.deepEqual(reversedSpelling.map((ref) => ({ ref: ref.ref, repo: ref.repo, number: ref.number })), [
+    { ref: "o/r#584", repo: "o/r", number: 584 },
+  ]);
+  assert.equal(reversedSpelling[0]!.closing, true);
+
+  // Case-insensitive owner/repo comparison.
+  const caseInsensitive = extractLinkedIssueRefs("Closes O/R#584", "o/r", "feat: thing (#584)");
+  assert.equal(caseInsensitive.length, 1, "O/R#584 and defaultRepo o/r must be the same identity");
+  assert.equal(caseInsensitive[0]!.closing, true);
+
+  // A different repo's #584 is a genuinely different identity and must not merge.
+  const differentRepo = extractLinkedIssueRefs("Closes other/repo#584", "o/r", "feat: thing (#584)");
+  assert.equal(differentRepo.length, 2, "different repos with the same issue number are distinct identities");
 });
 
 test("linear prefixes and identifiers parse conservatively", () => {
@@ -235,6 +319,68 @@ test("selection signature fails conservatively on unknown inputs", async () => {
   const { signature, error } = await buildSelectionSignature("o/r", "1", adapter);
   assert.equal(signature, null);
   assert.match(error, /linked issue #2 fetch failed/);
+});
+
+test("selection fingerprint: a duplicate spelling of the same issue is fetched once, not twice (#872 canonical dedupe)", async () => {
+  // The body names issue #2 twice, once bare and once with an explicit
+  // same-repo owner/repo prefix — extractLinkedIssueRefs merges these into
+  // one canonical identity upstream, so the fingerprint must only fetch (and
+  // hash) it once, never perturbed by how many spellings the text used.
+  let issueFetches = 0;
+  const adapter: PlatformAdapter = {
+    platform: "github",
+    ghApi: async (endpoint: string) => {
+      if (endpoint === "repos/o/r/pulls/1") return { data: { title: "t", body: "Fixes #2 and also refs o/r#2" } };
+      if (endpoint === "repos/o/r/issues/2") {
+        issueFetches += 1;
+        return { data: { number: 2, labels: [{ name: "security" }] } };
+      }
+      return { error: `no fixture response for endpoint: ${endpoint}` };
+    },
+  } as unknown as PlatformAdapter;
+  const { signature, error } = await buildSelectionSignature("o/r", "1", adapter);
+  assert.equal(error, "");
+  assert.ok(signature);
+  assert.equal(issueFetches, 1, "bare #2 and explicit o/r#2 are the same canonical identity — one fetch");
+});
+
+test("#872 cross-stage: the selection fingerprint applies the SAME accepted-issue cap as buildLinkedIssueContext — a rejected title PR never evicts the real 8th body issue, and its own labels never perturb the signature", async () => {
+  // Title trails "(#879)" — getIssue for #879 returns a pull_request
+  // payload, so the shared acceptedLinkedIssues generator rejects it
+  // without consuming one of the 8 accepted-issue slots. Eight body issues
+  // (#1..#8, closing keywords) are all real and must all be accepted.
+  const body = Array.from({ length: 8 }, (_, i) => `Closes #${i + 1}`).join("\n");
+  const buildAdapter = (selfPrLabels: string[], issue8Labels: string[]): PlatformAdapter => ({
+    platform: "github",
+    ghApi: async (endpoint: string) => {
+      if (endpoint === "repos/o/r/pulls/1") return { data: { title: "feat: thing (#879)", body } };
+      if (endpoint === "repos/o/r/issues/879") {
+        return { data: { number: 879, pull_request: { url: "https://example/pulls/879" }, labels: selfPrLabels.map((name) => ({ name })) } };
+      }
+      const match = /^repos\/o\/r\/issues\/(\d+)$/.exec(endpoint);
+      if (match) {
+        const n = Number(match[1]);
+        const labels = n === 8 ? issue8Labels : [`label-${n}`];
+        return { data: { number: n, labels: labels.map((name) => ({ name })) } };
+      }
+      return { error: `no fixture response for endpoint: ${endpoint}` };
+    },
+  } as unknown as PlatformAdapter);
+
+  const base = await buildSelectionSignature("o/r", "1", buildAdapter(["p0"], ["team-a"]));
+  assert.equal(base.error, "");
+  assert.ok(base.signature, "the signature must build successfully — #8 was not evicted, so no unknown label to fail closed on");
+
+  // Changing issue #8's labels must change the signature: proves #8 (the
+  // real 8th accepted issue) is actually in the hashed payload, not evicted
+  // by the rejected title ref.
+  const issue8Changed = await buildSelectionSignature("o/r", "1", buildAdapter(["p0"], ["team-b"]));
+  assert.notEqual(issue8Changed.signature, base.signature, "issue #8's label change must be visible in the signature");
+
+  // Changing the self-referencing pull request's labels must be inert: it
+  // was rejected, so its labels must never enter the hashed payload.
+  const selfPrChanged = await buildSelectionSignature("o/r", "1", buildAdapter(["p1", "urgent"], ["team-a"]));
+  assert.equal(selfPrChanged.signature, base.signature, "the rejected pull request's labels must never perturb the signature");
 });
 
 // ── Managed body selection ───────────────────────────────────────────────
