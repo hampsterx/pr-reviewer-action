@@ -263,6 +263,17 @@ export function runProcess(options: RunProcessOptions): ProcessHandle {
         return;
       }
 
+      // CodeQL js/indirect-command-line-injection: argv-only spawn, no
+      // `shell` option, so args/env can never be reinterpreted as shell
+      // syntax. `options.env` is always an allowlisted copy built by
+      // `buildChildEnv` from operator/workflow config (never PR content).
+      // `options.file` is either a fixed binary (`git`, `process.execPath`)
+      // or, for `src/evidence/providers.ts`'s "bash -lc <command>" shape, an
+      // operator-configured evidence-provider command from trusted workflow
+      // config — never PR-controlled (that trust boundary is documented at
+      // its call site). Every call site that folds PR/diff-derived text into
+      // `options.args` (see `src/tools/executors.ts`, `src/run/stages.ts`)
+      // places it after a `--` separator so it cannot be read as a flag.
       child = spawn(options.file, options.args ?? [], {
         detached: true,
         cwd: options.cwd,
