@@ -121,6 +121,13 @@ test("comment publication upserts a marked body with verdict and sanitized markd
   assert.ok(body.includes("Safe."));
 });
 
+test("published body strips the analysis engine's base URL (#832)", async () => {
+  const api = new MockPublishApi();
+  await publishReview(input({ analysisEngine: "m@https://llm.internal.test/v1 (openai)" }), api, { diffText: "" });
+  const body = api.sticky[0]!.body;
+  assert.ok(body.includes("_Analysis engine: m (openai)_"));
+});
+
 test("sticky publication failure returns failed status and error", async () => {
   const api = new MockPublishApi();
   api.stickyResult = { ok: false, created: false, error: "permission denied" };

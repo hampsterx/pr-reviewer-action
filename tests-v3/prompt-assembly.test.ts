@@ -19,6 +19,7 @@ import {
   buildUserMessage,
   handleModelFailure,
   jqRawPrKind,
+  publicAnalysisEngine,
   resolveSystemPrompt,
   workspaceAt,
 } from "../src/prompt/index.js";
@@ -170,6 +171,22 @@ test("annotateAnalysisEngine explains the route", () => {
   assert.equal(annotateAnalysisEngine(e, "fallback"), `${e} — fallback (primary failed)`);
   assert.equal(annotateAnalysisEngine(e, "escalated", { escalationReasons: "r" }), `${e} — escalated (r)`);
   assert.equal(annotateAnalysisEngine(e, "escalated"), `${e} — escalated (unknown)`);
+});
+
+test("publicAnalysisEngine strips the base URL but keeps model, format, and route (#832)", () => {
+  const cases: Array<[string, string]> = [
+    ["m@https://llm.example.net/v1 (openai)", "m (openai)"],
+    ["m@https://user:secret@llm.example.net/v1 (anthropic)", "m (anthropic)"],
+    [
+      annotateAnalysisEngine("m@https://x.example.org/v1 (openai)", "fallback"),
+      "m (openai) — fallback (primary failed)",
+    ],
+    ["test-engine", "test-engine"],
+  ];
+  for (const [engine, expected] of cases) {
+    assert.equal(publicAnalysisEngine(engine), expected);
+  }
+  assert.equal(publicAnalysisEngine(MODEL_UNAVAILABLE_ENGINE), MODEL_UNAVAILABLE_ENGINE);
 });
 
 test("harness fallback strips placeholders from the bundled default when no prompt is assembled", () => {
