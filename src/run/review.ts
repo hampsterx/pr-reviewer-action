@@ -77,6 +77,7 @@ import {
   runToolHarnessPhase,
   safeJson,
   safeJsonArray,
+  seededFileTotals,
   specialistWorkspace,
 } from "./stages.js";
 import type { ReadResult } from "../platform/types.js";
@@ -359,12 +360,27 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
   const generatedPaths = await generatedAttributePaths(workspace, diffText, budgets.primary.maxDiff);
   ws.write("pr.diff.truncated", prioritizeDiff(Buffer.from(diffText, "utf8"), budgets.primary.maxDiff, { generated: generatedPaths }));
 
-  const filesResult = await adapter.listPrFiles();
-  if (!filesResult.ok) throw new RunReviewError(`platform_pr_files failed: ${filesResult.error}`);
-  const prFilesRaw = filesResult.data;
-  ws.write("pr-files.raw.json", pyJsonDumps(prFilesRaw));
-  const totalChangedFiles = typeof pr.changedFiles === "number" ? pr.changedFiles : 0;
-  const rawFilesList = Array.isArray(prFilesRaw) ? prFilesRaw : [];
+  const seededFiles = safeJsonArray(ws.read("pr-files.seed.json"));
+  let rawFilesList: unknown[];
+  let totalChangedFiles: number;
+  if (seededFiles !== null) {
+    log("Reusing PR file list derived from the pinned diff");
+    rawFilesList = seededFiles;
+    const totals = seededFileTotals(rawFilesList);
+    totalChangedFiles = totals.changedFiles;
+    pr.changedFiles = totals.changedFiles;
+    pr.additions = totals.additions;
+    pr.deletions = totals.deletions;
+    ws.write("pr.json", pyJsonDumps(pr));
+    ws.write("pr-files.raw.json", pyJsonDumps(rawFilesList));
+  } else {
+    const filesResult = await adapter.listPrFiles();
+    if (!filesResult.ok) throw new RunReviewError(`platform_pr_files failed: ${filesResult.error}`);
+    const prFilesRaw = filesResult.data;
+    ws.write("pr-files.raw.json", pyJsonDumps(prFilesRaw));
+    totalChangedFiles = typeof pr.changedFiles === "number" ? pr.changedFiles : 0;
+    rawFilesList = Array.isArray(prFilesRaw) ? prFilesRaw : [];
+  }
   ws.write("pr-files.json", filesProjection(rawFilesList, totalChangedFiles));
   ws.write("pr-files.truncated.json", truncateClean(Buffer.from(filesProjection(rawFilesList, totalChangedFiles)), budgets.primary.maxFiles, "…[file list truncated]"));
   ws.write("pr-body.txt", String(pr.body ?? ""));
@@ -442,7 +458,7 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
   const linked = await buildMetadataContext(pr, supersededCutoff);
 
   // Manifest context (context.sh tail).
-  const manifest = buildManifestContext(prFilesRaw, workspace);
+  const manifest = buildManifestContext(rawFilesList, workspace);
   for (const [name, data] of manifest.artifacts) ws.write(name, data);
 
   // ── Advisory phases (the #371 background forks, in-process) ──────────
