@@ -55,7 +55,7 @@ export interface EngineRouting {
 export function annotateAnalysisEngine(engine: string, origin: string, routing: EngineRouting = {}): string {
   switch (origin) {
     case "fallback":
-      return `${engine} — fallback (primary failed)`;
+      return `${engine} — fallback (${routing.reviewRoute === "smart" ? "smart" : "primary"} failed)`;
     case "escalated":
       return `${engine} — escalated (${routing.escalationReasons || "unknown"})`;
     case "primary": {

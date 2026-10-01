@@ -1367,6 +1367,8 @@ async function producePrimaryReview(input: ReviewCallInput & { runDir?: string }
   const { env, ws, profiles, log, errorLog } = input;
   const toolMode = (env.TOOL_MODE ?? "off").toLowerCase();
   const harness = safeJson(ws.read("tool-harness.json"));
+  const firstTier = env.REVIEW_ROUTE === "smart" ? "smart" : "primary";
+  const firstProfile = tierProfileFrom(profiles, firstTier, env);
 
   // native_loop in-conversation verdict (#205/#637): parse the harness's own
   // verdict response and skip the separate review call when it is reusable.
@@ -1375,7 +1377,9 @@ async function producePrimaryReview(input: ReviewCallInput & { runDir?: string }
     if (responseBytes !== null && responseBytes.length > 0) {
       log("native_loop produced an in-conversation verdict; using it and skipping the separate review call");
       try {
-        const parsed = parseVerdictResponse(JSON.parse(Buffer.from(responseBytes).toString("utf8")), [profiles.primary.apiKey]);
+        // The native loop calls the route-bound AI_* environment. With routing
+        // off, that can differ from an explicit primary profile override.
+        const parsed = parseVerdictResponse(JSON.parse(Buffer.from(responseBytes).toString("utf8")), [env.AI_API_KEY ?? ""]);
         const artifact = reviewArtifactFromParsed(parsed) as unknown as Record<string, unknown>;
         ws.write("ai-output.json", Buffer.from(`${pyJsonDumps(artifact)}\n`, "utf8"));
         return {
@@ -1401,11 +1405,10 @@ async function producePrimaryReview(input: ReviewCallInput & { runDir?: string }
     log(`native_loop did not produce a reusable in-conversation verdict (${String(harness.native_loop_verdict_reason ?? "unknown")}); falling back to the standard review call`);
   }
 
-  const primaryProfile = tierProfileFrom(profiles, "primary", env);
-  const engineBase = analysisEngineBase(env.AI_MODEL ?? "", env.AI_BASE_URL ?? "", env.AI_API_FORMAT ?? "openai");
-  const primary = await callTier("primary", primaryProfile, input, "review-corpus.truncated.md", "ai-request.primary.json", "ai-response.primary.json");
+  const engineBase = analysisEngineBase(firstProfile.model, firstProfile.baseUrl, firstProfile.apiFormat);
+  const primary = await callTier(firstTier, firstProfile, input, "review-corpus.truncated.md", "ai-request.primary.json", "ai-response.primary.json");
   if (primary.ok) {
-    log("Primary model succeeded");
+    log(`${firstProfile.label} model succeeded`);
     return {
       artifact: primary.artifact,
       analysisEngine: annotateAnalysisEngine(engineBase, "primary", {
@@ -1419,13 +1422,13 @@ async function producePrimaryReview(input: ReviewCallInput & { runDir?: string }
 
   // Fallback is availability recovery, never quality escalation.
   if (!profiles.fallback.resolved) {
-    const outcome = handleModelFailure("Primary model unavailable and no fallback model configured", env.ON_MODEL_FAILURE ?? "fail");
+    const outcome = handleModelFailure(`${firstProfile.label} model unavailable and no fallback model configured`, env.ON_MODEL_FAILURE ?? "fail");
     if (outcome.action === "fail") throw new RunReviewError(outcome.reason);
     log("on_model_failure=notice: emitting a request_changes notice instead of failing the check");
     return noticeResult(ws, outcome);
   }
 
-  errorLog(`Primary model unavailable after retries; trying fallback: ${profiles.fallback.model} @ ${profiles.fallback.baseUrl} (${profiles.fallback.apiFormat})`);
+  errorLog(`${firstProfile.label} model unavailable after retries; trying fallback: ${profiles.fallback.model} @ ${profiles.fallback.baseUrl} (${profiles.fallback.apiFormat})`);
   // #368: the fallback re-truncates the initial corpus at 120000 bytes.
   ws.write("review-corpus.fallback.truncated.md", truncateClean(ws.read("review-corpus.md") ?? new Uint8Array(0), 120000, "…[content truncated]\n"));
   const fallbackProfile = tierProfileFrom(profiles, "fallback", env);
@@ -1437,6 +1440,7 @@ async function producePrimaryReview(input: ReviewCallInput & { runDir?: string }
       analysisEngine: annotateAnalysisEngine(
         analysisEngineBase(profiles.fallback.model, profiles.fallback.baseUrl, profiles.fallback.apiFormat),
         "fallback",
+        { ...(env.REVIEW_ROUTE !== undefined ? { reviewRoute: env.REVIEW_ROUTE } : {}) },
       ),
       fromPrimary: false,
       fromFallback: true,
