@@ -38,7 +38,7 @@ retried once non-streamed before the loop gives up on that turn.
 
 | Tool | Reads | Gated by |
 | --- | --- | --- |
-| `read_file` | A file in the checked-out workspace, optionally a line window (`offset`/`limit`). Path traversal, symlink escapes, and sensitive files (`.env`, `.pem`, `credentials`, `id_rsa`, `.kube/config`, …) are blocked. Output capped at ~12 KB (pre-offset) or `tool-max-response-bytes`. | workspace path guard; tracked-files filter (see below) |
+| `read_file` | A file in the checked-out workspace, optionally a line window (`offset`/`limit`). Path traversal, symlink escapes, and sensitive files (`.env`, `.pem`, `credentials`, `id_rsa`, `.kube/config`, …) are blocked. Output capped at the per-result limit (12 KB by default; see [Context limits](#context-limits)). | workspace path guard; tracked-files filter (see below) |
 | `find_files` | Repository file paths (not contents) matching a glob against the relative path or basename, e.g. `*config*`, `*.toml`, `*/route.ts`. Sorted, capped at `max_results` (default 100, max 300). Never descends into `.git` or follows symlinks. | tracked-files filter |
 | `list_tree` | Repository entries (`{path, type}`, no contents) bounded by `depth` (default 2, clamped 1..4) and `max_entries` (default 200, max 500). A file path returns a one-row listing. | tracked-files filter |
 | `git_grep` | Matching lines (`path:lineno:content`) via `git grep -E`, optionally scoped to a `path` subtree, capped at `max_results` (1..200, default 60). An invalid regex is retried as a fixed string. | workspace path guard; tracked-files filter |
@@ -130,9 +130,39 @@ without tracking the call budget.
 - `tool-request-timeout-sec` (default 20) bounds each individual tool
   execution (file read, grep, API call, fetch).
 
+### Context limits
+
+Three limits bound what the loop holds. Without a declared context window
+they are fixed; declare one per tier (`primary-model-context-tokens`,
+`smart-model-context-tokens`, or `model-context-tokens` for both) and they
+scale with it:
+
+| Limit | No window declared | Window declared (normal range, ceiling) | Input override |
+| --- | --- | --- | --- |
+| Conversation budget (compaction threshold) | 24,000 tokens | ~25% of the window, up to 250k tokens | — |
+| First-turn corpus | 50 KB | ~15% of the window, up to 600 KB | `tool-corpus-max-bytes` |
+| Each tool result | 12 KB | ~2% of the window, up to 64 KB | `tool-max-response-bytes` |
+
+These ranges are normal values, not minimums: for a small window, reserving
+the per-turn completion takes priority and can push all three below the
+undeclared defaults (32k window with a 16k completion: 14,384 tokens /
+25,891 bytes / 3,452 bytes).
+
+A declared window first reserves `tool-max-tokens-per-turn` plus 2,000
+tokens of framing, so the conversation and each turn's completion always fit;
+the first-turn corpus stays within ~60% of the conversation budget and each
+result within ~8%. A window too small for the per-turn completion plus a
+4,000-token conversation is refused at startup. For a 1M-token model that is
+250k tokens / 450 KB / 60 KB; for 262k it is 65k tokens / 118 KB / 16 KB.
+Explicit byte inputs are operator overrides: they're used as-is, even
+beyond the derived envelope, and fitting the model's window is then up to
+you. The marker's
+`context_budget` and `context_peak` show the budget a run used and how much
+of it the conversation actually reached (see [Telemetry](telemetry.md)).
+
 ### Context compaction
 
-When the conversation outgrows its internal context budget, the oldest tool
+When the conversation outgrows its context budget, the oldest tool
 results are compacted before the next turn so the model's view stays within
 budget while the newest results stay verbatim:
 

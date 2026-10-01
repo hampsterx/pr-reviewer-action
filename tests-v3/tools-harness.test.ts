@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { redactedJson, writeOutputs, runToolHarness, buildToolLoopTelemetry, replaceHarnessFindingsSection, verdictHarnessFindingsBody, normalizeToolRequest, resolveLoopLimits, buildPlanningContext, accumulateUsage, usageWithCacheRatio, PLANNING_NOTES, type HarnessDeps, type HarnessResult } from "../src/tools/harness.js";
+import { LoopContextError, loopContextLimits, redactedJson, writeOutputs, runToolHarness, buildToolLoopTelemetry, replaceHarnessFindingsSection, verdictHarnessFindingsBody, normalizeToolRequest, resolveLoopLimits, buildPlanningContext, accumulateUsage, usageWithCacheRatio, PLANNING_NOTES, type HarnessDeps, type HarnessResult } from "../src/tools/harness.js";
 import type { LoopOutcome } from "../src/tools/loop.js";
 import { renderSpecialistLeadsSection } from "../src/specialists/index.js";
 import { KNOWN_SECRET_REDACTED, redactText } from "../src/context/redact.js";
@@ -629,4 +629,69 @@ test("#899: redactedJson stays valid JSON when a secret pattern would swallow a 
 test("#899: redactedJson keeps the serialized-redaction bytes whenever they parse", () => {
   const summary = { tool_results: [{ result: { content: "plain text" } }], stop_reason: "model-stopped" };
   assert.equal(redactedJson(summary), JSON.stringify(summary, null, 2));
+});
+
+test("#922: without a declared window the loop keeps the v3.1 context limits", () => {
+  assert.deepEqual(loopContextLimits({}, "primary"), { maxConversationTokens: 24000, corpusMaxBytes: 50000, maxResponseBytes: 12000 });
+  assert.deepEqual(loopContextLimits({ TOOL_CORPUS_MAX_BYTES: "", TOOL_MAX_RESPONSE_BYTES: "" }, "smart"), { maxConversationTokens: 24000, corpusMaxBytes: 50000, maxResponseBytes: 12000 });
+});
+
+test("#922: a declared window scales the loop's context limits per tier", () => {
+  assert.deepEqual(loopContextLimits({ PRIMARY_MODEL_CONTEXT_TOKENS: "1000000" }, "primary"), { maxConversationTokens: 250000, corpusMaxBytes: 450000, maxResponseBytes: 60000 });
+  assert.deepEqual(loopContextLimits({ PRIMARY_MODEL_CONTEXT_TOKENS: "262144" }, "primary"), { maxConversationTokens: 65536, corpusMaxBytes: 117964, maxResponseBytes: 15728 });
+  // A small window reserves the per-turn completion first: 32768 - 16384 - 2000.
+  assert.deepEqual(
+    loopContextLimits({ PRIMARY_MODEL_CONTEXT_TOKENS: "32768", TOOL_MAX_TOKENS_PER_TURN: "16384" }, "primary"),
+    { maxConversationTokens: 14384, corpusMaxBytes: 25891, maxResponseBytes: 3452 },
+  );
+  assert.deepEqual(
+    loopContextLimits({ PRIMARY_MODEL_CONTEXT_TOKENS: "32768", TOOL_MAX_TOKENS_PER_TURN: "4096" }, "primary"),
+    { maxConversationTokens: 24000, corpusMaxBytes: 43200, maxResponseBytes: 5760 },
+  );
+  // The smart tier reads its own window, then the global one.
+  assert.equal(loopContextLimits({ SMART_MODEL_CONTEXT_TOKENS: "400000", PRIMARY_MODEL_CONTEXT_TOKENS: "32768" }, "smart").maxConversationTokens, 100000);
+  assert.equal(loopContextLimits({ MODEL_CONTEXT_TOKENS: "400000" }, "smart").maxConversationTokens, 100000);
+});
+
+test("#922: explicit byte inputs override the window-derived limits", () => {
+  const limits = loopContextLimits({ PRIMARY_MODEL_CONTEXT_TOKENS: "1000000", TOOL_CORPUS_MAX_BYTES: "70000", TOOL_MAX_RESPONSE_BYTES: "20000" }, "primary");
+  assert.equal(limits.corpusMaxBytes, 70000);
+  assert.equal(limits.maxResponseBytes, 20000);
+  assert.equal(limits.maxConversationTokens, 250000);
+});
+
+test("#922: loop telemetry carries the conversation budget and peak only when the loop reported them", () => {
+  const base: HarnessResult = {
+    tool_budget_tier: "primary",
+    tool_request_budget: 24,
+    tool_budget_source: "tier-default",
+    tool_budget_configured: null,
+    stop_reason: "model-stopped",
+    tool_loop_meta: { max_rounds: 24, wall_clock_sec: 1.2, requests_remaining: 10, elapsed_sec: 0.5, tool_result_bytes: 0 },
+  };
+  const legacy = buildToolLoopTelemetry({ ...base });
+  assert.equal((legacy!.budget as Record<string, unknown>).max_conversation_tokens, undefined);
+  assert.equal((legacy!.usage as Record<string, unknown>).peak_conversation_tokens, undefined);
+
+  const withContext = buildToolLoopTelemetry({
+    ...base,
+    tool_loop_meta: { ...(base.tool_loop_meta as Record<string, unknown>), max_conversation_tokens: 250000, peak_conversation_tokens: 61234 },
+  });
+  assert.equal((withContext!.budget as Record<string, unknown>).max_conversation_tokens, 250000);
+  assert.equal((withContext!.usage as Record<string, unknown>).peak_conversation_tokens, 61234);
+});
+
+test("#922: the conversation plus the per-turn completion always fits a declared window", () => {
+  for (const window of [24576, 32768, 65536, 131072, 262144, 1000000]) {
+    const limits = loopContextLimits({ PRIMARY_MODEL_CONTEXT_TOKENS: String(window), TOOL_MAX_TOKENS_PER_TURN: "16384" }, "primary");
+    assert.ok(limits.maxConversationTokens + 16384 + 2000 <= window, `window ${window}`);
+    assert.ok(limits.corpusMaxBytes / 3 <= limits.maxConversationTokens, `window ${window}`);
+  }
+});
+
+test("#922: a declared window too small for the per-turn completion is refused", () => {
+  assert.throws(
+    () => loopContextLimits({ PRIMARY_MODEL_CONTEXT_TOKENS: "16384", TOOL_MAX_TOKENS_PER_TURN: "16384" }, "primary"),
+    LoopContextError,
+  );
 });

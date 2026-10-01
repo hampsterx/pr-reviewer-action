@@ -14,6 +14,7 @@ import { pythonJsonStringify } from "../precheck/metadata.js";
 import { buildHarnessObligations } from "../requirements/obligations.js";
 import { externalChecksConclusion } from "../precheck/decide.js";
 import { readStandardsFileAtRef, StandardsFileRefError } from "../context/standards-file-ref.js";
+import { loopContextLimits } from "../tools/harness.js";
 import { DEFAULT_STANDARDS_FILE_CANDIDATES } from "../context/standards-file.js";
 import { runChatRequest } from "../transport/transport.js";
 import { describeTransportFailure } from "../transport/http.js";
@@ -176,6 +177,9 @@ export interface RunReviewResult {
    * against (see `adaptiveLoopBudgets` in src/tools/loop.ts). */
   toolRoundsUsed?: number;
   toolMaxRounds?: number;
+  /** #922: the loop's conversation budget and peak (approx tokens). */
+  contextBudget?: number;
+  contextPeak?: number;
   /** Wall-clock seconds for the whole run. */
   durationSec: number;
 }
@@ -334,9 +338,17 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     modelContextTokens: env.MODEL_CONTEXT_TOKENS,
     primaryModelContextTokens: env.PRIMARY_MODEL_CONTEXT_TOKENS,
     smartModelContextTokens: env.SMART_MODEL_CONTEXT_TOKENS,
+    // #922: only a configured fallback model can receive the shared corpus.
+    fallbackModelContextTokens: (env.AI_FALLBACK_MODEL ?? "") !== "" ? env.FALLBACK_MODEL_CONTEXT_TOKENS : undefined,
     aiMaxTokens: env.AI_MAX_TOKENS,
     contextLimitMode: env.CONTEXT_LIMIT_MODE,
   });
+  // #922: a declared window too small for the native loop fails up front,
+  // like a too-small corpus window, rather than overflowing every turn.
+  if ((env.TOOL_MODE ?? "off").toLowerCase() === "native_loop") {
+    loopContextLimits(env, "primary");
+    if (env.AI_SMART_MODEL) loopContextLimits(env, "smart");
+  }
   env.MAX_CORPUS = String(budgets.primary.maxCorpus);
   env.MAX_DIFF = String(budgets.primary.maxDiff);
   env.MAX_FILES = String(budgets.primary.maxFiles);
@@ -1047,6 +1059,8 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     ...(toolBudgetTelemetry.calls !== undefined ? { toolCalls: toolBudgetTelemetry.calls } : {}),
     ...(toolBudgetTelemetry.rounds !== undefined ? { toolRounds: toolBudgetTelemetry.rounds } : {}),
     ...(toolBudgetTelemetry.maxRounds !== undefined ? { maxRounds: toolBudgetTelemetry.maxRounds } : {}),
+    ...(toolBudgetTelemetry.contextBudget !== undefined ? { contextBudget: toolBudgetTelemetry.contextBudget } : {}),
+    ...(toolBudgetTelemetry.contextPeak !== undefined ? { contextPeak: toolBudgetTelemetry.contextPeak } : {}),
   });
   return {
     outputs,
@@ -1069,6 +1083,8 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     ...(toolBudgetTelemetry.calls !== undefined ? { toolCallsUsed: toolBudgetTelemetry.calls } : {}),
     ...(toolBudgetTelemetry.rounds !== undefined ? { toolRoundsUsed: toolBudgetTelemetry.rounds } : {}),
     ...(toolBudgetTelemetry.maxRounds !== undefined ? { toolMaxRounds: toolBudgetTelemetry.maxRounds } : {}),
+    ...(toolBudgetTelemetry.contextBudget !== undefined ? { contextBudget: toolBudgetTelemetry.contextBudget } : {}),
+    ...(toolBudgetTelemetry.contextPeak !== undefined ? { contextPeak: toolBudgetTelemetry.contextPeak } : {}),
   };
 }
 
@@ -1121,9 +1137,11 @@ function toolBudgetTelemetryOf(harness: Record<string, unknown> | null): {
   calls?: number;
   rounds?: number;
   maxRounds?: number;
+  contextBudget?: number;
+  contextPeak?: number;
 } {
   if (harness === null) return {};
-  const out: { budget?: number; source?: string; calls?: number; rounds?: number; maxRounds?: number } = {};
+  const out: { budget?: number; source?: string; calls?: number; rounds?: number; maxRounds?: number; contextBudget?: number; contextPeak?: number } = {};
   if (typeof harness.tool_request_budget === "number") out.budget = harness.tool_request_budget;
   if (typeof harness.tool_budget_source === "string" && harness.tool_budget_source !== "") {
     out.source = harness.tool_budget_source;
@@ -1142,6 +1160,13 @@ function toolBudgetTelemetryOf(harness: Record<string, unknown> | null): {
     const budget = (telemetry as Record<string, unknown>).budget;
     if (budget !== null && typeof budget === "object" && typeof (budget as Record<string, unknown>).max_rounds === "number") {
       out.maxRounds = (budget as Record<string, unknown>).max_rounds as number;
+    }
+    // #922: the conversation budget the loop compacted against and its peak.
+    if (budget !== null && typeof budget === "object" && typeof (budget as Record<string, unknown>).max_conversation_tokens === "number") {
+      out.contextBudget = (budget as Record<string, unknown>).max_conversation_tokens as number;
+    }
+    if (usage !== null && typeof usage === "object" && typeof (usage as Record<string, unknown>).peak_conversation_tokens === "number") {
+      out.contextPeak = (usage as Record<string, unknown>).peak_conversation_tokens as number;
     }
   }
   return out;
