@@ -667,7 +667,8 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
   // ── Claim falsification pre-pass (#785), in flight with the other gates ──
   // Fail-soft: any failure leaves claim-falsification.md empty and the
   // review proceeds unchanged. Deterministic scan first; the bounded model
-  // call on the primary route runs only when that scan finds nothing.
+  // pass on the primary route always runs when configured and merges on top
+  // of the scan's claims (#898).
   ws.write("claim-falsification.md", new Uint8Array(0));
   let claimsPromise: Promise<void> = Promise.resolve();
   if ((env.CLAIM_FALSIFICATION ?? "false").toLowerCase() === "true") {
