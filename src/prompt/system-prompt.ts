@@ -128,7 +128,7 @@ export function applySystemPromptFragments(
     const bytes = workspace.readBytes(PROMPT_PRESENCE_FILES.classification);
     const kind = bytes === null ? "" : jqRawPrKind(bytes.toString("utf8"));
     const infra = kind === "dependency_upgrade" || kind === "k8s_manifest";
-    const digest = kind === "renovate_digest_only";
+    const digest = kind === "renovate_digest_only" || kind === "image_digest_only";
     sub("VERSION_BUMP_GUIDANCE", infra ? guidance(assets, "version_bump") : "");
     sub("IMAGE_DIGEST_GUIDANCE", digest ? guidance(assets, "image_digest") : "");
     sub("RELEASE_NOTES_GUIDANCE", infra || digest ? guidance(assets, "release_notes") : "");
@@ -173,11 +173,21 @@ export function applyRequirementTraceFragment(
   workspace: PromptWorkspace,
   enabled: boolean,
   assets: PromptAssets = BUNDLED_PROMPT_ASSETS,
+  scopeIds?: readonly string[],
 ): SystemPromptState {
   if (!state.isDefault || !enabled) return state;
   if (!workspace.isNonEmpty(PROMPT_PRESENCE_FILES.requirementLedger)) return state;
-  const trace = bashCapture(rawFragment(assets, "requirement_trace"));
+  // #935: with a deterministic scope, ask only for the in-scope requirements
+  // (none in scope: no trace instructions at all).
+  if (scopeIds !== undefined && scopeIds.length === 0) return state;
+  let trace = bashCapture(rawFragment(assets, "requirement_trace"));
   if (trace === "") return state;
+  if (scopeIds !== undefined) {
+    trace = trace.replace(
+      "For every acceptance/normative requirement in the Requirement Ledger,",
+      `For every requirement in trace scope (${scopeIds.join(", ")}); other ledger requirements need no trace,`,
+    );
+  }
   if (state.systemPrompt.includes(trace)) return state;
   return { ...state, systemPrompt: `${state.systemPrompt}\n${trace}` };
 }
