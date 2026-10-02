@@ -829,6 +829,8 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
       ws.write("tool-harness.json", toolGate.json);
     } else {
       log(`Running tool harness in mode: ${toolMode}`);
+      // The tier names the first-pass artifact slot. On a direct smart route
+      // the loop limits follow REVIEW_CONTEXT_PROFILE (loopLimitsProfile).
       env.TOOL_HARNESS_TIER = "primary";
       await runToolHarnessPhase(ws, env, workspace, log);
     }
@@ -1394,6 +1396,15 @@ async function callTier(
   return { ok: false, artifact: null, rawResponse: null };
 }
 
+/** Every API key the run could have sent, longest first so a key that
+ * contains another is masked whole: the route-bound AI_API_KEY plus each
+ * configured profile, so the mask holds if the route binding changes. */
+function configuredApiKeys(routeKey: string | undefined, profiles: TierProfiles): string[] {
+  const keys = [routeKey, profiles.primary.apiKey, profiles.smart.apiKey, profiles.fallback.apiKey]
+    .filter((key): key is string => typeof key === "string" && key !== "");
+  return [...new Set(keys)].sort((a, b) => b.length - a.length);
+}
+
 /** review.sh: the primary call (native-verdict fast path, then the standard
  * corpus review) and the fallback on total primary failure. */
 async function producePrimaryReview(input: ReviewCallInput & { runDir?: string }): Promise<{
@@ -1415,9 +1426,9 @@ async function producePrimaryReview(input: ReviewCallInput & { runDir?: string }
     if (responseBytes !== null && responseBytes.length > 0) {
       log("native_loop produced an in-conversation verdict; using it and skipping the separate review call");
       try {
-        // The native loop calls the route-bound AI_* environment. With routing
-        // off, that can differ from an explicit primary profile override.
-        const parsed = parseVerdictResponse(JSON.parse(Buffer.from(responseBytes).toString("utf8")), [env.AI_API_KEY ?? ""]);
+        // The native loop calls the route-bound AI_* environment, which can
+        // differ from an explicit primary profile override, so mask every key.
+        const parsed = parseVerdictResponse(JSON.parse(Buffer.from(responseBytes).toString("utf8")), configuredApiKeys(env.AI_API_KEY, profiles));
         const artifact = reviewArtifactFromParsed(parsed) as unknown as Record<string, unknown>;
         ws.write("ai-output.json", Buffer.from(`${pyJsonDumps(artifact)}\n`, "utf8"));
         return {
@@ -1444,6 +1455,9 @@ async function producePrimaryReview(input: ReviewCallInput & { runDir?: string }
   }
 
   const engineBase = analysisEngineBase(firstProfile.model, firstProfile.baseUrl, firstProfile.apiFormat);
+  // The *.primary.json names are the first-pass slot, not the model: a direct
+  // smart route writes its request here too. Read the model from the request
+  // body or the analysis-engine line, never from the filename.
   const primary = await callTier(firstTier, firstProfile, input, "review-corpus.truncated.md", "ai-request.primary.json", "ai-response.primary.json");
   if (primary.ok) {
     log(`${firstProfile.label} model succeeded`);
@@ -1540,7 +1554,7 @@ async function runSmartReview(input: SmartReviewInput): Promise<{ ok: boolean }>
       const responseBytes = ws.read("ai-response.smart.json");
       if (status !== "request-error" && status !== "wall-clock-exceeded" && produced && responseBytes !== null && responseBytes.length > 0) {
         try {
-          const parsed = parseVerdictResponse(JSON.parse(Buffer.from(responseBytes).toString("utf8")), [input.profiles.smart.apiKey]);
+          const parsed = parseVerdictResponse(JSON.parse(Buffer.from(responseBytes).toString("utf8")), configuredApiKeys(env.AI_API_KEY, profiles));
           const artifact = reviewArtifactFromParsed(parsed) as unknown as Record<string, unknown>;
           ws.write("ai-output.json", Buffer.from(`${pyJsonDumps(artifact)}\n`, "utf8"));
           log("Smart tool harness produced a verdict");
