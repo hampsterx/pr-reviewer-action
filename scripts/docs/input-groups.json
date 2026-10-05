@@ -61,8 +61,7 @@
       "ai-smart-model",
       "ai-smart-base-url",
       "ai-smart-api-format",
-      "ai-smart-api-key",
-      "escalate-on-risk-flags"
+      "ai-smart-api-key"
     ]
   },
   {

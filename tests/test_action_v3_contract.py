@@ -20,6 +20,7 @@ REMOVED_INPUTS = {
     "escalate_on_fast_low_confidence",
     "escalate_on_tool_or_evidence_blockers",
     "escalate_on_tool_planning_failure",
+    "escalate_on_risk_flags",
 }
 REMOVED_OUTPUTS = {
     "effective_review_scope",

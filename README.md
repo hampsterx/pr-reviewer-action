@@ -90,7 +90,7 @@ The action works on **GitHub** and **Forgejo** (1.4.x), with **Tangled** resolva
 | CI status check polling | ✅ Full | ✅ Commit-status polling (Forgejo REST) |
 | Evidence providers | ✅ Full | ✅ Full |
 | Tool harness | ✅ Full | ✅ Full |
-| Fast/smart model routing | ✅ Full | ✅ Full |
+| Reviewer-requested smart escalation | ✅ Full | ✅ Full |
 
 > **Note:** On Forgejo, features requiring GitHub's GraphQL API (review minimization) are skipped with a clear log line. The core review pipeline and all REST-based features work fully.
 

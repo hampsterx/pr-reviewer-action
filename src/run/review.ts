@@ -36,7 +36,7 @@ import {
 import { extractRequirementLedger, ledgerToArtifact, renderRequirementLedgerMarkdown } from "../requirements/ledger.js";
 import { requirementLedgerPresence } from "../requirements/presence.js";
 import { classifyPr, classificationToArtifact } from "../classification/classify.js";
-import { resolveReviewRoute, resolveTierProfiles, routeSignalsFromClassification, tierRequestShape, type TierProfiles } from "../routing/tiers.js";
+import { resolveReviewRoute, resolveTierProfiles, tierRequestShape, type TierProfiles } from "../routing/tiers.js";
 import { reviewerRequestedEscalation } from "../routing/escalation.js";
 import { buildSpecialistCorpus } from "../specialists/corpus.js";
 import { forkGate, type ForkedGate, type GateName, type GateOutcome } from "../gates/gates.js";
@@ -609,20 +609,13 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
   // up being.
   env.SUBSTANTIAL_CODE_CHANGE = classification.substantialCodeChange ? "true" : "false";
 
-  const { route, reason } = resolveReviewRoute({
-    routingMode: env.REVIEW_ROUTING_MODE ?? "off",
-    routeSignals: routeSignalsFromClassification(classificationArtifact),
-    escalateOnRiskFlags: splitCsv(env.ESCALATE_ON_RISK_FLAGS ?? ""),
-    smartModelResolved: profiles.smart.resolved,
-  });
+  const { route, reason } = resolveReviewRoute({ routingMode: env.REVIEW_ROUTING_MODE ?? "off" });
   env.REVIEW_ROUTE = route;
   env.ROUTE_REASON = reason;
   if (route === "primary") {
     Object.assign(env, { AI_BASE_URL: profiles.primary.baseUrl, AI_MODEL: profiles.primary.model, AI_API_FORMAT: profiles.primary.apiFormat, AI_API_KEY: profiles.primary.apiKey });
-  } else if (route === "smart") {
-    Object.assign(env, { AI_BASE_URL: profiles.smart.baseUrl, AI_MODEL: profiles.smart.model, AI_API_FORMAT: profiles.smart.apiFormat, AI_API_KEY: profiles.smart.apiKey });
   }
-  env.REVIEW_CONTEXT_PROFILE = route === "smart" ? "smart" : "primary";
+  env.REVIEW_CONTEXT_PROFILE = "primary";
   log(`Review route: ${route} (${reason}) → ${env.AI_MODEL}`);
 
   promptState = applySystemPromptFragments(promptState, {
@@ -663,7 +656,9 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
   env.SYSTEM_PROMPT = promptState.systemPrompt;
 
   // Corpus build #1 (initial review owns the primary artifact slot).
-  const profileKey: "primary" | "smart" = env.REVIEW_CONTEXT_PROFILE === "smart" ? "smart" : "primary";
+  // #965: the first pass is always the primary profile — the smart tier is
+  // selected at escalation, not before the review runs.
+  const profileKey: "primary" | "smart" = "primary";
   let corpusResult = assembleCorpus(ws, env, budgets, profileKey, "primary", generatedPaths, standards);
   ws.write("review-corpus.truncated.md", ws.read(corpusResult.outputName) ?? new Uint8Array(0));
 
@@ -1430,7 +1425,7 @@ function tierProfileFrom(profiles: TierProfiles, tier: "primary" | "fallback" | 
     connectTimeoutSec: resolved.connectTimeoutSec,
     retries: resolved.retries,
     retryDelaySec: resolved.retryDelaySec,
-    shape: tierRequestShape(tier === "smart" ? "smart" : tier === "fallback" ? "fallback" : (env.REVIEW_CONTEXT_PROFILE === "smart" ? "smart" : "primary"), env),
+    shape: tierRequestShape(tier === "smart" ? "smart" : tier === "fallback" ? "fallback" : "primary", env),
     maxTokens: aiMaxTokens,
     temperature: temperatureRaw === "" ? "" : Number(temperatureRaw) || 0.1,
     responseFormat: (env.AI_RESPONSE_FORMAT ?? "off") as TierProfile["responseFormat"],
@@ -1734,7 +1729,7 @@ function writeStepSummary(stepSummaryPath: string, input: SummaryInput): void {
   const total = typeof coverageSummary.total === "number" ? coverageSummary.total : 0;
   const unknown = typeof coverageSummary.unknown === "number" ? coverageSummary.unknown : 0;
 
-  const profileKey = input.route === "escalated" || env.REVIEW_CONTEXT_PROFILE === "smart" ? "smart" : "primary";
+  const profileKey = input.route === "escalated" ? "smart" : "primary";
   const budget = input.budgets[profileKey];
   const corpusName = input.route === "escalated" ? "review-corpus.smart.truncated.md" : "review-corpus.truncated.md";
   const corpusBytes = byteLength(ws.read(corpusName));

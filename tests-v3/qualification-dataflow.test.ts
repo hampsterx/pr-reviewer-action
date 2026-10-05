@@ -12,7 +12,7 @@ import { classifyPr, classificationToArtifact } from "../src/classification/clas
 import { classificationFromArtifact, selectSpecialistRoles } from "../src/classification/role-selection.js";
 import { canonicalChangedFile, normalizeLinkedIssues } from "../src/context/index.js";
 import { buildLinkedIssueContext } from "../src/context/linked-issue-context.js";
-import { resolveReviewRoute, routeSignalsFromClassification } from "../src/routing/tiers.js";
+import { resolveReviewRoute } from "../src/routing/tiers.js";
 import { runPrecheck } from "../src/precheck/decide.js";
 import type { PlatformAdapter } from "../src/platform/types.js";
 import type { ReadResult } from "../src/platform/types.js";
@@ -23,17 +23,14 @@ import { readFileSync } from "node:fs";
 const enc = (text: string): Uint8Array => Buffer.from(text, "utf8");
 const dec = (data: Uint8Array | undefined): string => Buffer.from(data ?? new Uint8Array(0)).toString("utf8");
 const noLinear = { apiKey: "", prefixes: "", timeoutSec: "20", enableForForks: "false" };
-const ESCALATE_ON = ["linked_security_issue", "linked_priority_p0", "linked_priority_p1"];
-
 // ── github-label-routing (#633) ───────────────────────────────────────────
 // v2 subject: tests/test_linked_issue_classification.sh. The linked-issue
 // context pipeline must enrich the canonical linked-issues.json with fetched
 // GitHub labels so classify.ts (which reads that value) emits the linked
-// risk flags, deep_review=auto role selection sees them, and the smart-route
-// resolver reacts to the exact classification artifact — never a
+// risk flags and deep_review=auto role selection sees them — never a
 // helper-only echo of the right answer.
 
-test("github-label-routing: fetched labels reach linked-issues, risk flags, role selection and the smart route", async () => {
+test("github-label-routing: fetched labels reach linked-issues, risk flags and role selection", async () => {
   const issues: Record<string, unknown> = {
     "12": { number: 12, labels: [{ name: "security" }] },
     "13": { number: 13, labels: [{ name: "priority/p0" }] },
@@ -60,44 +57,24 @@ test("github-label-routing: fetched labels reach linked-issues, risk flags, role
   const selection = selectSpecialistRoles(classification);
   assert.deepEqual(selection.selectedRoles, ["correctness", "security"]);
 
-  const smart = resolveReviewRoute({
-    routingMode: "auto",
-    routeSignals: classification.routeSignals,
-    escalateOnRiskFlags: ESCALATE_ON,
-    smartModelResolved: true,
-  });
-  assert.equal(smart.route, "smart");
-
-  // A valid helper result cannot compensate for a stale/bare canonical
-  // artifact: strip the fetched labels back out and the route degrades.
-  const bare = normalized.map((item) => ({ ...item, labels: [] }));
-  const bareClassification = classifyPr({ prFiles: [], linkedIssues: bare });
-  const primary = resolveReviewRoute({
-    routingMode: "auto",
-    routeSignals: bareClassification.routeSignals,
-    escalateOnRiskFlags: ESCALATE_ON,
-    smartModelResolved: true,
-  });
-  assert.equal(primary.route, "primary");
-
-  // Restoring the enriched canonical artifact restores smart routing.
-  assert.equal(
-    resolveReviewRoute({
-      routingMode: "auto",
-      routeSignals: classification.routeSignals,
-      escalateOnRiskFlags: ESCALATE_ON,
-      smartModelResolved: true,
-    }).route,
-    "smart",
-  );
-
-  // The v2 route resolver read a persisted classification.json artifact,
-  // not the in-memory classifier result; prove the artifact round trip
-  // carries the same route signals into resolveReviewRoute.
   const artifact = JSON.parse(JSON.stringify(classificationToArtifact(classification))) as Record<string, unknown>;
   const rebuilt = classificationFromArtifact(artifact);
   assert.ok(rebuilt !== null);
-  assert.deepEqual(routeSignalsFromClassification(artifact), classification.routeSignals);
+  assert.deepEqual(rebuilt.riskFlags, classification.riskFlags);
+  assert.deepEqual(rebuilt.routeSignals, classification.routeSignals);
+  assert.deepEqual(selectSpecialistRoles(rebuilt).selectedRoles, ["correctness", "security"]);
+
+  // Linked metadata changes classification and specialist selection, never
+  // the primary-first model route.
+  assert.deepEqual(resolveReviewRoute({ routingMode: "auto" }), {
+    route: "primary",
+    reason: "primary-first: the primary reviews first; smart is reviewer-requested only (#721)",
+  });
+  const bare = normalized.map((item) => ({ ...item, labels: [] }));
+  const bareClassification = classifyPr({ prFiles: [], linkedIssues: bare });
+  assert.ok(!bareClassification.riskFlags.includes("linked_security_issue"));
+  assert.ok(!bareClassification.riskFlags.includes("linked_priority_p0"));
+  assert.deepEqual(selectSpecialistRoles(bareClassification).selectedRoles, ["correctness"]);
 });
 
 test("github-label-routing: a failed GitHub fetch is fail-soft data but fails selection toward scrutiny", async () => {

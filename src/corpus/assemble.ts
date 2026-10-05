@@ -290,8 +290,9 @@ export function buildReviewCorpus(
   let filesFile = "pr-files.truncated.json";
   let harnessFile = "tool-harness.md";
 
-  // The initial review always owns the primary artifact slot; a directly
-  // routed smart model only changes the context profile, not artifact names.
+  // The initial review always owns the primary artifact slot; a smart-tier
+  // run (escalation) gets its own slot, and the context profile — not the
+  // artifact name — follows the profile.
   if (opts.tier === "smart") {
     if (opts.slot === "smart") {
       outputName = "review-corpus.smart.truncated.md";

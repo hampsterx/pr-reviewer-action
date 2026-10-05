@@ -413,7 +413,7 @@ test("smart rebuild truncates from the raw sources, never the poisoned primary a
   assert.equal(result.outputName, "review-corpus.smart.truncated.md");
 });
 
-test("direct smart routing keeps the primary artifact slot and reads tool-harness.md", () => {
+test("smart-tier corpus build for a primary slot keeps primary artifacts and reads tool-harness.md", () => {
   const ws = {
     ...baseWorkspace(),
     toolHarnessMd: enc("Primary harness findings.\n"),

@@ -75,9 +75,9 @@ Set `ai-api-format: anthropic` to post to `/messages` instead of `/chat/completi
 
 `ai-fallback-base-url`/`ai-fallback-api-format`/`ai-fallback-api-key` each default to the primary `ai-*` value when left blank; only `ai-fallback-model` has no default (an empty value means no fallback is configured).
 
-## Fast/smart routing
+## Primary-first routing (#965)
 
-`review-routing-mode: auto` sends boring PRs to a fast/local model and scary ones straight to a smarter one, based on the deterministic classification — before any review runs:
+`review-routing-mode: auto` is the primary-first policy: every review starts on the primary model, and the smart model has exactly one entrance — a completed primary verdict that explicitly requests it:
 
 ```yaml
 - uses: misospace/pr-reviewer-action@v3
@@ -92,19 +92,13 @@ Set `ai-api-format: anthropic` to post to `/messages` instead of `/chat/completi
     review-routing-mode: auto
 ```
 
-- `off` (default): preserves the existing primary/fallback behavior exactly; the `review-route` output reports `legacy`.
-- `auto`: a PR whose `route_signals` (its `pr_kind` plus `risk_flags`) match `escalate-on-risk-flags` routes directly to the **smart** model; everything else routes to the **fast** (primary) model.
-- `route_signals` excludes content-only pattern matches: a flag or kind that fired only because the diff *text* mentioned a pattern (e.g. `os.path`, `token`) doesn't route by itself — an actual changed filename, or a linked issue, has to back it. This keeps benign PRs on the fast model.
-- The fast config defaults to the primary `ai-*` inputs. The smart config's endpoint/format/key also default to those same primary inputs, but the smart **model** is opt-in (`ai-smart-model`) — with no smart model configured, a risk match logs and stays on the fast model rather than failing.
+- `off` (default): preserves legacy behavior; the `ai-*` model configuration is used as-is, the `review-route` output reports `legacy`, and no profile binding or post-primary escalation happens.
+- `auto`: the initial review **always** runs on the primary model — deterministic classification never selects the smart model before any review runs (#965). Deep-review specialists inherit the primary profile. The smart model is reached only when the completed primary verdict sets `smart_review_requested: true` (#721), bounded to one rerun.
+- Deterministic classification (`route_signals` — the `pr_kind` plus file-backed risk flags) remains available for specialist role selection, required-check validation, and telemetry. It never routes the model. Since #965 the `escalate-on-risk-flags` input no longer exists: there is no pre-primary smart route to configure.
+- The fast config defaults to the primary `ai-*` inputs. The smart config's endpoint/format/key also default to those same primary inputs, but the smart **model** is opt-in (`ai-smart-model`) — with no smart model configured, an escalation request logs and the primary review publishes rather than failing.
 - The chosen route is reported by the `review-route` output, the step summary, and the managed metadata marker. Routing config is part of the precheck fingerprint, so changing it forces a fresh review.
 
-`escalate-on-risk-flags` default value:
-
-```
-linked_security_issue,linked_priority_p0,linked_priority_p1,auth_changes,public_route_changes,file_serving_changes,path_handling_changes,secret_handling_changes,db_or_migration_changes
-```
-
-## Escalation of insufficient fast reviews (#721)
+## Escalation of insufficient primary reviews (#721)
 
 In `auto` mode, a successful primary (fast) review can still be re-run on the smart model after the fact — but only when the **primary reviewer itself asks for it**. The primary model returns a structured `smart_review_requested` boolean (with a bounded `smart_review_reason`) in its verdict JSON; the action escalates only when that field is literally `true`. PR-controlled prose can't forge the request, malformed output is never treated as a request, and a smart review can never request another smart review.
 
@@ -115,6 +109,6 @@ A set of older heuristic triggers from `src/routing/escalation.ts` are **depreca
 - `fast_request_changes`, `fast_low_confidence`, `tool_or_evidence_blockers`, `incomplete_required_checks`, `tool_planning_failed`.
 - The autonomous incomplete-requirement-coverage retry is removed entirely; unknown coverage stays visible in the coverage artifact and step summary, and the primary reviewer may fold it into its own `smart_review_requested` decision.
 
-Unchanged: deterministic direct smart routing **before** the primary runs (`escalate-on-risk-flags`), first-pass failure (primary, or smart on a direct route) → fallback as an availability recovery (never an escalation target), and deterministic enforcement running independent of escalation.
+Unchanged: first-pass failure (primary) → fallback as an availability recovery (never an escalation target), and deterministic enforcement running independent of escalation. Changed by #965: there is no direct smart route before the primary runs anymore — `escalate-on-risk-flags` is gone, so the only smart call is the reviewer-requested rerun below.
 
-Only the **final** review is published. If the smart model fails, the primary review publishes instead — escalation never turns into a failed run. `review-route` reports `escalated` and `escalation-reason` carries `primary_requested`; both land in the step summary, the managed metadata marker, and the published review's `_Analysis engine:_` line (`— routed smart (risk match: …)` vs `— escalated (…)` vs `— fallback (primary failed)` or `— fallback (smart failed)`), so you can tell a deliberate smart review from an escalation or an availability fallback at a glance. Worst case is two model calls per review; the unchanged-diff skip keeps that bounded across runs.
+Only the **final** review is published. If the smart model fails, the primary review publishes instead — escalation never turns into a failed run. `review-route` reports `escalated` and `escalation-reason` carries `primary_requested`; both land in the step summary, the managed metadata marker, and the published review's `_Analysis engine:_` line (`— primary route` vs `— escalated (…)` vs `— fallback (primary failed)`), so you can tell a deliberate escalation from an availability fallback at a glance. Worst case is two model calls per review; the unchanged-diff skip keeps that bounded across runs.

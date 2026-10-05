@@ -556,11 +556,11 @@ test("#867: primary and fallback both classify a non-2xx reply as transport, and
   }
 });
 
-test("reviewer-requested escalation publishes the smart review", async () => {
-  let call = 0;
+test("#965: auto routing escalates only after the primary reviewer requests it", async () => {
+  const models: string[] = [];
   const server = await startMockServer((_req, body, res) => {
-    call += 1;
     const model = (JSON.parse(body) as { model: string }).model;
+    models.push(model);
     res.setHeader("Content-Type", "application/json");
     if (model === "primary-m") {
       res.end(verdictBody(baseVerdict({
@@ -600,17 +600,17 @@ test("reviewer-requested escalation publishes the smart review", async () => {
     assert.equal(result.outputs.escalationReason, "primary_requested");
     assert.match(result.outputs.analysisEngine, /— escalated \(primary_requested\)/);
     assert.match(result.outputs.reviewMarkdown, /Escalated review\./);
+    assert.deepEqual(models, ["primary-m", "smart-m"], "smart must run only after the primary requests escalation");
     // The published verdict can no longer request another escalation.
     const published = JSON.parse(readFileSync(join(runDir, "ai-output.json"), "utf8")) as Record<string, unknown>;
     assert.equal(published.smart_review_requested, false);
-    assert.ok(call >= 2, "expected at least a primary and a smart call");
   } finally {
     await server.close();
     cleanup();
   }
 });
 
-test("direct smart route calls the smart endpoint and reports the model that answered", async () => {
+test("#965: auto routing starts on primary even for an auth-risk PR", async () => {
   const primaryServer = await startMockServer((_req, _body, res) => {
     res.setHeader("Content-Type", "application/json");
     res.end(verdictBody(baseVerdict({ review_markdown: "Primary review.\n" })));
@@ -620,16 +620,15 @@ test("direct smart route calls the smart endpoint and reports the model that ans
     res.end(verdictBody(baseVerdict({ review_markdown: "Smart review.\n" })));
   });
   const { runDir, cleanup } = withRunDir();
-  const primaryRun = withRunDir();
   const inputs = {
     "github-token": "tok", repo: "o/r", "pr-number": "7",
     "ai-base-url": primaryServer.url, "ai-model": "primary-m", "ai-api-key": "primary-key",
     "ai-smart-base-url": smartServer.url, "ai-smart-model": "smart-m", "ai-smart-api-key": "smart-key",
     "ai-stream": "false", "review-routing-mode": "auto",
-    "escalate-on-risk-flags": "auth_changes", "tool-mode": "off", "deep-review": "false",
+    "tool-mode": "off", "deep-review": "false",
   };
   try {
-    const smartResult = await runReview({
+    const primaryResult = await runReview({
       env: {}, inputs, runDir, workspace: runDir,
       platformAdapter: mockPlatform({
         files: [{ filename: "src/auth/login.ts", status: "modified", additions: 1, deletions: 1, changes: 2 }],
@@ -637,42 +636,34 @@ test("direct smart route calls the smart endpoint and reports the model that ans
       }),
       quiet: true,
     });
-    assert.equal(smartResult.outputs.reviewRoute, "smart");
-    assert.equal(primaryServer.requests.length, 0, "direct smart routing must not call the primary endpoint");
-    assert.equal(smartServer.requests.length, 1);
-    assert.ok(smartServer.requests.every((request) => request.headers.authorization === "Bearer smart-key"));
-    assert.ok(smartServer.requests.every((request) => (JSON.parse(request.body) as { model: string }).model === "smart-m"));
-    assert.equal((JSON.parse(readFileSync(join(runDir, "ai-request.primary.json"), "utf8")) as { model: string }).model, "smart-m");
-    assert.equal(smartResult.outputs.analysisEngine, `smart-m@${smartServer.url} (openai) — routed smart (risk match: auth_changes)`);
-    assert.match(smartResult.outputs.reviewMarkdown, /Smart review\./);
-    const smartCalls = smartServer.requests.length;
-
-    const primaryResult = await runReview({
-      env: {}, inputs, runDir: primaryRun.runDir, workspace: primaryRun.runDir,
-      platformAdapter: mockPlatform(), quiet: true,
-    });
     assert.equal(primaryResult.outputs.reviewRoute, "primary");
-    assert.equal(primaryServer.requests.length, 1);
+    assert.equal(primaryServer.requests.length, 1, "auto routing must call primary even for an auth-risk PR");
+    assert.equal(smartServer.requests.length, 0, "risk flags alone must not trigger smart escalation");
     assert.equal(primaryServer.requests[0]!.headers.authorization, "Bearer primary-key");
     assert.equal((JSON.parse(primaryServer.requests[0]!.body) as { model: string }).model, "primary-m");
-    assert.equal(smartServer.requests.length, smartCalls);
-    assert.match(primaryResult.outputs.analysisEngine, /^primary-m@/);
+    assert.equal((JSON.parse(readFileSync(join(runDir, "ai-request.primary.json"), "utf8")) as { model: string }).model, "primary-m");
+    const classification = JSON.parse(readFileSync(join(runDir, "classification.json"), "utf8")) as { risk_flags: string[] };
+    assert.ok(classification.risk_flags.includes("auth_changes"), "fixture must actually classify as an auth-risk PR");
+    assert.equal(primaryResult.outputs.analysisEngine, `primary-m@${primaryServer.url} (openai) — primary route`);
+    assert.match(primaryResult.outputs.reviewMarkdown, /Primary review\./);
   } finally {
     await primaryServer.close();
     await smartServer.close();
     cleanup();
-    primaryRun.cleanup();
   }
 });
 
-test("direct smart failure uses smart retries and the availability fallback", async () => {
+test("primary failure uses primary retries and the availability fallback", async () => {
   const primaryServer = await startMockServer((_req, _body, res) => {
+    res.statusCode = 400;
     res.setHeader("Content-Type", "application/json");
-    res.end(verdictBody(baseVerdict()));
+    res.end(JSON.stringify({ error: "primary unavailable" }));
   });
+  let smartCalls = 0;
   const smartServer = await startMockServer((_req, _body, res) => {
+    smartCalls += 1;
     res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ choices: [] }));
+    res.end(verdictBody(baseVerdict({ review_markdown: "Smart should not run.\n" })));
   });
   const fallbackServer = await startMockServer((_req, _body, res) => {
     res.setHeader("Content-Type", "application/json");
@@ -687,20 +678,21 @@ test("direct smart failure uses smart retries and the availability fallback", as
         "ai-base-url": primaryServer.url, "ai-model": "primary-m", "ai-api-key": "primary-key",
         "ai-smart-base-url": smartServer.url, "ai-smart-model": "smart-m", "ai-smart-api-key": "smart-key",
         "ai-fallback-base-url": fallbackServer.url, "ai-fallback-model": "fallback-m", "ai-fallback-api-key": "fallback-key",
-        "ai-stream": "false", "review-routing-mode": "auto", "escalate-on-risk-flags": "auth_changes",
-        "ai-primary-retries": "1", "ai-smart-retries": "2", "ai-primary-retry-delay-sec": "0", "tool-mode": "off", "deep-review": "false",
+        "ai-stream": "false", "review-routing-mode": "auto",
+        "ai-primary-retries": "2", "ai-primary-retry-delay-sec": "0", "ai-connect-timeout-sec": "2",
+        "ai-request-timeout-sec": "2", "tool-mode": "off", "deep-review": "false",
       },
       runDir, workspace: runDir,
       platformAdapter: mockPlatform({ files: [{ filename: "src/auth/login.ts", status: "modified", additions: 1, deletions: 1, changes: 2 }] }),
       sleep: async () => {}, quiet: true,
     });
-    assert.equal(result.outputs.reviewRoute, "smart");
-    assert.equal(primaryServer.requests.length, 0);
-    assert.equal(smartServer.requests.length, 2);
-    assert.ok(smartServer.requests.every((request) => request.headers.authorization === "Bearer smart-key"));
+    assert.equal(result.outputs.reviewRoute, "primary");
+    assert.equal(primaryServer.requests.length, 2, "primary retries must be used before fallback");
+    assert.equal(smartCalls, 0, "risk flags alone must not route a failure to smart");
+    assert.ok(primaryServer.requests.every((request) => request.headers.authorization === "Bearer primary-key"));
     assert.equal(fallbackServer.requests.length, 1);
     assert.equal(fallbackServer.requests[0]!.headers.authorization, "Bearer fallback-key");
-    assert.equal(result.outputs.analysisEngine, `fallback-m@${fallbackServer.url} (openai) — fallback (smart failed)`);
+    assert.equal(result.outputs.analysisEngine, `fallback-m@${fallbackServer.url} (openai) — fallback (primary failed)`);
     assert.match(result.outputs.reviewMarkdown, /Fallback review\./);
     assert.equal(result.outputs.escalationReason, "");
   } finally {
@@ -711,14 +703,17 @@ test("direct smart failure uses smart retries and the availability fallback", as
   }
 });
 
-test("#940: direct smart recovery truncates the fallback corpus to the fallback's declared capacity", async () => {
+test("#940: the declared fallback capacity bounds primary and recovery corpora", async () => {
   const primaryServer = await startMockServer((_req, _body, res) => {
+    res.statusCode = 400;
     res.setHeader("Content-Type", "application/json");
-    res.end(verdictBody(baseVerdict()));
+    res.end(JSON.stringify({ error: "primary unavailable" }));
   });
+  let smartCalls = 0;
   const smartServer = await startMockServer((_req, _body, res) => {
+    smartCalls += 1;
     res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ choices: [] }));
+    res.end(verdictBody(baseVerdict({ review_markdown: "Smart should not run.\n" })));
   });
   const fallbackServer = await startMockServer((_req, _body, res) => {
     res.setHeader("Content-Type", "application/json");
@@ -726,10 +721,8 @@ test("#940: direct smart recovery truncates the fallback corpus to the fallback'
   });
   const { runDir, cleanup } = withRunDir();
   try {
-    // A diff large enough that the smart-profile corpus (~157KB) exceeds both
-    // the fallback's derived capacity (16848 = (24000 - 16384 - 2000) * 3)
-    // and the historical 120000-byte constant. The mid sentinel sits between
-    // the two, so the old constant-path recovery request would retain it.
+    // The declared fallback window also caps the initial primary corpus. Place
+    // a sentinel beyond that shared budget and verify neither request sees it.
     const filler = (n: number): string => `+padding ${String(n).padStart(6, "0")} of inert context filler for the review corpus`;
     const lines: string[] = [
       "diff --git a/big.txt b/big.txt",
@@ -737,7 +730,7 @@ test("#940: direct smart recovery truncates the fallback corpus to the fallback'
       "--- a/big.txt",
       "+++ b/big.txt",
       "@@ -1,2 +1,2600 @@",
-      "+HEAD-SENTINEL-940 kept by the recovery cut",
+      "+HEAD-SENTINEL-940 retained within the shared capacity",
     ];
     let size = lines.join("\n").length;
     let n = 0;
@@ -746,7 +739,7 @@ test("#940: direct smart recovery truncates the fallback corpus to the fallback'
       lines.push(line);
       size += line.length + 1;
     }
-    lines.push("+MID-SENTINEL-940 dropped by the recovery cut");
+    lines.push("+MID-SENTINEL-940 beyond the shared capacity");
     size += lines[lines.length - 1]!.length + 1;
     for (; size < 156000; n += 1) {
       const line = filler(n);
@@ -760,9 +753,9 @@ test("#940: direct smart recovery truncates the fallback corpus to the fallback'
         "ai-base-url": primaryServer.url, "ai-model": "primary-m", "ai-api-key": "primary-key",
         "ai-smart-base-url": smartServer.url, "ai-smart-model": "smart-m", "ai-smart-api-key": "smart-key",
         "ai-fallback-base-url": fallbackServer.url, "ai-fallback-model": "fallback-m", "ai-fallback-api-key": "fallback-key",
-        "smart-model-context-tokens": "200000", "fallback-model-context-tokens": "24000", "ai-max-tokens": "16384",
-        "ai-stream": "false", "review-routing-mode": "auto", "escalate-on-risk-flags": "auth_changes",
-        "ai-primary-retries": "1", "ai-smart-retries": "1", "ai-primary-retry-delay-sec": "0", "tool-mode": "off", "deep-review": "false",
+        "primary-model-context-tokens": "400000", "fallback-model-context-tokens": "24000", "ai-max-tokens": "16384",
+        "ai-stream": "false", "review-routing-mode": "auto",
+        "ai-primary-retries": "1", "ai-primary-retry-delay-sec": "0", "tool-mode": "off", "deep-review": "false",
       },
       runDir, workspace: runDir,
       platformAdapter: mockPlatform({
@@ -771,16 +764,16 @@ test("#940: direct smart recovery truncates the fallback corpus to the fallback'
       }),
       sleep: async () => {}, quiet: true,
     });
-    assert.equal(result.outputs.reviewRoute, "smart");
-    assert.equal(primaryServer.requests.length, 0, "direct smart routing must not call the primary endpoint");
+    assert.equal(result.outputs.reviewRoute, "primary");
+    assert.equal(primaryServer.requests.length, 1, "the primary request must fail before fallback recovery");
+    assert.equal(smartCalls, 0, "a primary failure must not trigger smart review");
 
-    // The smart first-pass budget is untouched: the assembled corpus keeps
-    // content far beyond what the recovery request may carry.
-    const assembled = readFileSync(join(runDir, "review-corpus.md"));
-    assert.ok(assembled.length > 120000, `assembled smart corpus must exceed the historical constant, got ${assembled.length}`);
-    assert.ok(assembled.includes("MID-SENTINEL-940"), "the assembled corpus must retain the mid sentinel");
+    const primaryCorpus = readFileSync(join(runDir, "review-corpus.truncated.md"));
+    assert.ok(primaryCorpus.length <= 16848, `primary corpus must respect the fallback-derived capacity, got ${primaryCorpus.length}`);
+    assert.ok(primaryCorpus.includes("HEAD-SENTINEL-940"), "the primary corpus must retain its head");
+    assert.ok(!primaryCorpus.includes("MID-SENTINEL-940"), "the primary corpus must omit content beyond the shared capacity");
 
-    // The recovery request is sized by the fallback's declared window.
+    // The recovery request uses the same declared fallback capacity.
     const fallbackCorpus = readFileSync(join(runDir, "review-corpus.fallback.truncated.md"));
     assert.ok(fallbackCorpus.length <= 16848, `fallback corpus must fit the derived capacity, got ${fallbackCorpus.length}`);
     assert.equal(fallbackServer.requests.length, 1);
@@ -796,25 +789,25 @@ test("#940: direct smart recovery truncates the fallback corpus to the fallback'
   }
 });
 
-test("direct smart native loop runs under the smart context window in the first-pass slot", async () => {
-  let toolCallSent = false;
-  const primaryServer = await startMockServer((_req, _body, res) => {
-    res.setHeader("Content-Type", "application/json");
-    res.end(verdictBody(baseVerdict()));
-  });
-  const smartServer = await startMockServer((_req, body, res) => {
+test("#965: auto native loop starts on primary with the primary context window", async () => {
+  let primaryToolCallSent = false;
+  const primaryServer = await startMockServer((_req, body, res) => {
     const request = JSON.parse(body) as { tools?: unknown[] };
     res.setHeader("Content-Type", "application/json");
-    if (!toolCallSent && Array.isArray(request.tools) && request.tools.length > 0) {
-      toolCallSent = true;
+    if (!primaryToolCallSent && Array.isArray(request.tools) && request.tools.length > 0) {
+      primaryToolCallSent = true;
       res.end(JSON.stringify({
-        id: "c0", object: "chat.completion", model: "smart-m",
-        choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{ id: "t1", type: "function", function: { name: "read_file", arguments: '{"path":"README.md"}' } }] } }],
+        id: "p0", object: "chat.completion", model: "primary-m",
+        choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{ id: "pt1", type: "function", function: { name: "read_file", arguments: '{"path":"README.md"}' } }] } }],
         usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
       }));
       return;
     }
-    res.end(verdictBody(baseVerdict({ review_markdown: "Smart review.\n" })));
+    res.end(verdictBody(baseVerdict({ review_markdown: "Primary native review.\n" })));
+  });
+  const smartServer = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict({ review_markdown: "Smart should not run.\n" })));
   });
   const { runDir, cleanup } = withRunDir();
   try {
@@ -826,27 +819,27 @@ test("direct smart native loop runs under the smart context window in the first-
         "github-token": "tok", repo: "o/r", "pr-number": "7",
         "ai-base-url": primaryServer.url, "ai-model": "primary-m", "ai-api-key": "primary-key",
         "ai-smart-base-url": smartServer.url, "ai-smart-model": "smart-m", "ai-smart-api-key": "smart-key",
-        "primary-model-context-tokens": "400000", "smart-model-context-tokens": "200000",
-        "ai-stream": "false", "review-routing-mode": "auto", "escalate-on-risk-flags": "auth_changes",
+        "primary-model-context-tokens": "200000", "smart-model-context-tokens": "400000",
+        "ai-stream": "false", "review-routing-mode": "auto",
         "tool-mode": "native_loop", "deep-review": "false",
       },
       runDir, workspace: runDir,
       platformAdapter: mockPlatform({ files: [{ filename: "src/auth/login.ts", status: "modified", additions: 1, deletions: 1, changes: 2 }] }),
       quiet: true,
     });
-    assert.equal(result.outputs.reviewRoute, "smart");
-    assert.equal(primaryServer.requests.length, 0, "direct smart routing must not call the primary endpoint");
-    assert.ok(smartServer.requests.length >= 2, "the native loop must run against the smart endpoint");
-    assert.ok(smartServer.requests.every((request) => request.headers.authorization === "Bearer smart-key"));
-    assert.equal(existsSync(join(runDir, "tool-harness.smart.json")), false, "the first pass keeps its artifact slot");
+    assert.equal(result.outputs.reviewRoute, "primary");
+    assert.ok(primaryServer.requests.length >= 2, "the primary native loop must execute its tool and verdict turns");
+    assert.ok(primaryServer.requests.every((request) => request.headers.authorization === "Bearer primary-key"));
+    assert.equal(smartServer.requests.length, 0, "an auth-risk classification alone must not invoke smart");
+    assert.equal(existsSync(join(runDir, "tool-harness.smart.json")), false, "the initial pass stays in the primary artifact slot");
     const harness = JSON.parse(readFileSync(join(runDir, "tool-harness.json"), "utf8")) as {
       tool_loop_telemetry?: { route?: string; budget?: { max_conversation_tokens?: number } };
     };
     const telemetry = harness.tool_loop_telemetry;
-    assert.equal(telemetry?.route, "smart");
-    // The 200k smart window budgets 50k conversation tokens; the 400k
-    // primary window would budget 100k.
+    assert.equal(telemetry?.route, "primary");
+    // The initial pass uses its declared 200k primary context window.
     assert.equal(telemetry?.budget?.max_conversation_tokens, 50000);
+    assert.match(result.outputs.reviewMarkdown, /Primary native review\./);
   } finally {
     await primaryServer.close();
     await smartServer.close();
@@ -1335,11 +1328,10 @@ test("#810: a budget-exhausted tool loop publishes partial coverage in the run m
   }
 });
 
-test("#930: a direct-smart initial review grants corpus-diff credit through the primary artifact slot", async () => {
-  // The direct-smart profile builds tier=smart into the primary artifact
-  // slot (review-corpus.truncated.md) while the initial harness still runs
-  // at TOOL_HARNESS_TIER=primary — so the certified sidecar must be keyed by
-  // the slot, not the model tier. A tiny diff sits in the corpus whole; the
+test("#930: primary review grants corpus-diff credit through the primary artifact slot", async () => {
+  // The primary profile builds tier=primary into the first-pass artifact
+  // slot (review-corpus.truncated.md), and the initial harness runs at
+  // TOOL_HARNESS_TIER=primary. A tiny diff sits in the corpus whole; the
   // loop spends its one request on discovery, the budget stops, and the
   // credit completes coverage with no gap record at all.
   //
@@ -1379,7 +1371,6 @@ test("#930: a direct-smart initial review grants corpus-diff credit through the 
         "tool-mode": "native_loop",
         "tool-max-requests": "1",
         "review-routing-mode": "auto",
-        "escalate-on-risk-flags": "auth_changes",
         "ai-smart-model": "m",
       },
       runDir,
@@ -1395,10 +1386,10 @@ test("#930: a direct-smart initial review grants corpus-diff credit through the 
       quiet: true,
     });
     const harness = JSON.parse(readFileSync(join(runDir, "tool-harness.json"), "utf8")) as Record<string, unknown>;
-    // Fixture sanity: the run really took the direct-smart route and built
-    // the smart-profile corpus into the primary slot.
-    assert.equal(result.outputs.reviewRoute, "smart");
-    assert.ok(existsSync(join(runDir, "pr.diff.smart.truncated")), "the smart-profile build must have run");
+    // Fixture sanity: the run used primary-first routing and built the
+    // primary-profile corpus into the first-pass slot.
+    assert.equal(result.outputs.reviewRoute, "primary");
+    assert.ok(existsSync(join(runDir, "pr.diff.truncated")), "the primary-profile build must have run");
     assert.equal(harness.stop_reason, "tool-call-budget-exhausted");
     assert.equal(harness.partial_coverage, undefined, "complete coverage: the corpus credit resolves the only changed file");
     assert.deepEqual(harness.corpus_diff_covered_files, ["src/auth.ts"]);

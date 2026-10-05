@@ -183,8 +183,8 @@ function clampedPositive(raw: string | undefined): number | null {
 /**
  * Classify a harness run's budget tier. Mirrors tool_budget_route:
  *   primary   — the ordinary primary-tier harness run;
- *   smart     — a directly routed smart review (REVIEW_CONTEXT_PROFILE=smart)
- *               or the smart-tier harness run;
+ *   smart     — a harness run on the smart profile
+ *               (REVIEW_CONTEXT_PROFILE=smart, i.e. the smart tier);
  *   escalated — the smart-tier harness run under post-review escalation
  *               (run_review.sh exports TOOL_ESCALATION=true around it).
  */
