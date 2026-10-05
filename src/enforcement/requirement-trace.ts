@@ -366,15 +366,141 @@ export function changedSubjectText(diff: string, files: readonly string[]): stri
   return [...files, ...lines].join("\n").toLowerCase();
 }
 
+/** A single kept word longer than this cannot be a meaningful requirement
+ * concept; it is dropped so untrusted requirement text cannot build a
+ * `new RegExp` pattern large enough to throw (the module promises never to
+ * throw on malformed input). */
+const MAX_SUBJECT_TERM_CHARS = 200;
+
+/** #957: the two ways a requirement's text can establish subject overlap
+ * with a change. A *phrase* is an adjacent run of kept words — a multi-token
+ * concept like "source SHA" or "trust boundary". A *strong term* is a single
+ * kept word shaped like a distinctive identifier: it carries a digit
+ * (`sha256`, `utf8`) or an internal capital beyond the first letter
+ * (`sourceSha`, `repoDid`, `SQLite`). Plain single words — `docs`, `repo`,
+ * `request`, `only`, `never`, … — and bare acronyms (`PR`, `API`, `URLs`),
+ * which occur as ordinary prose in almost every diff, name nothing specific
+ * enough to establish scope on their own. That generic overlap is what let
+ * #956's unrelated standards leak in. */
+interface RequirementSubjectSignals {
+  phrases: string[][];
+  strongTerms: string[];
+}
+
+/** A single word is a strong term when it is identifier-shaped. */
+function isStrongTerm(word: string): boolean {
+  // A digit-bearing term is identifier-ish, but a one-letter-plus-digit
+  // fragment (`v3`, `p0`) is a version/flag token that occurs in ordinary
+  // paths (`tests-v3/`); those scope in only via a phrase.
+  if (/[0-9]/.test(word)) return word.length >= 3;
+  if (!/[A-Z]/.test(word.slice(1))) return false; // plain lowercase, or Capitalized
+  if (word === word.toUpperCase()) return false; // pure acronym: HTTP, API, PR, URL
+  if (/^[A-Z]{2,}s$/.test(word)) return false; // acronym + plural: URLs, APIs, JSONs
+  return true; // identifier: sourceSha, repoDid, SQLite, HTTPServer, GitHub
+}
+
+/** Split a requirement's text into its subject-overlap signals. Adjacency is
+ * over the raw word stream, so a stopword between two kept words (as in
+ * "compare the source SHA") breaks the phrase rather than gluing its halves
+ * together. */
+export function requirementSubjectSignals(text: string): RequirementSubjectSignals {
+  const rawWords = text.match(/[A-Za-z][A-Za-z0-9]*/g) ?? [];
+  const kept: { word: string; index: number }[] = [];
+  rawWords.forEach((word, index) => {
+    if (word.length < 2) return;
+    if (word.length > MAX_SUBJECT_TERM_CHARS) return;
+    if (TERM_STOPWORDS.has(word.toLowerCase())) return;
+    kept.push({ word, index });
+  });
+  const phrases: string[][] = [];
+  for (let i = 0; i < kept.length - 1; i += 1) {
+    if (kept[i + 1]!.index === kept[i]!.index + 1) phrases.push([kept[i]!.word, kept[i + 1]!.word]);
+  }
+  const strongTerms = kept.filter((entry) => isStrongTerm(entry.word)).map((entry) => entry.word.toLowerCase());
+  return { phrases, strongTerms };
+}
+
+/** True when the changed text contains a multi-token phrase. The joined
+ * spelling (`commitsha`) is a bare substring so it still catches camelCase
+ * concatenations like `validateCsrfToken` — with the deliberate trade-off
+ * that the same joined form can match inside a longer identifier; the
+ * delimited spellings (`commit sha`, `commit_sha`, `commit-sha`,
+ * `commit/sha`) are word-boundary anchored, so they cannot match inside a
+ * longer word (the pre-#957 rule let `data never` match `metadata never`). */
+function phraseMatched(words: readonly string[], changed: string): boolean {
+  const lower = words.map((word) => word.toLowerCase());
+  if (changed.includes(lower.join(""))) return true;
+  return [lower.join(" "), lower.join("_"), lower.join("-"), lower.join("/")].some((variant) => new RegExp(`\\b${escapeRegExp(variant)}\\b`).test(changed));
+}
+
+function termWordMatch(term: string, changed: string): boolean {
+  return new RegExp(`\\b${escapeRegExp(term)}\\b`).test(changed);
+}
+
+/** #958: explicit boundary ownership, supplied by repository config (never
+ * hardcoded here). `match` terms identify the requirement — every token must
+ * appear (case-insensitively, as a whole word) in its text; `owners` are
+ * narrow path globs whose changed files own that requirement. A requirement
+ * whose subject prose the diff never repeats stays in scope when a changed
+ * file is one of its declared owners. */
+export interface RequirementOwnership {
+  match: readonly string[];
+  owners: readonly string[];
+}
+
+/** Compile a requirement's `match` tokens and owner globs once, so a large
+ * changed-file list does not recompile a regex per path. */
+interface CompiledOwnership {
+  match: RegExp[];
+  owners: RegExp[];
+}
+
+/** Compile one narrow owner glob to a full-path regex. Only `*` (within a
+ * path segment) and `?` are wildcards; `**` and absolute/`..` patterns are
+ * rejected at config-parse time, so this never sees them. */
+function ownerPatternRegex(pattern: string): RegExp {
+  const source = pattern
+    .split("*")
+    .map((part) => part.split("?").map((chunk) => escapeRegExp(chunk)).join("[^/]"))
+    .join("[^/]*");
+  return new RegExp(`^${source}$`);
+}
+
+function compileOwnership(ownership: readonly RequirementOwnership[]): CompiledOwnership[] {
+  const compiled: CompiledOwnership[] = [];
+  for (const rule of ownership) {
+    if (!Array.isArray(rule.match) || !Array.isArray(rule.owners)) continue;
+    const match = rule.match
+      .filter((token) => typeof token === "string" && token !== "")
+      .map((token) => new RegExp(`\\b${escapeRegExp(token.toLowerCase())}\\b`));
+    const owners = rule.owners.filter((pattern) => typeof pattern === "string" && pattern !== "").map(ownerPatternRegex);
+    if (match.length === 0 || owners.length === 0) continue;
+    compiled.push({ match, owners });
+  }
+  return compiled;
+}
+
+/** True when a changed file path is a declared owner of the requirement: every
+ * `match` token appears as a whole word in the requirement text, and at least
+ * one of the rule's owner globs matches a changed path. */
+function ownershipTouched(compiled: readonly CompiledOwnership[], text: string, paths: readonly string[]): boolean {
+  const haystack = text.toLowerCase();
+  for (const rule of compiled) {
+    if (rule.match.length === 0 || !rule.match.every((pattern) => pattern.test(haystack))) continue;
+    if (rule.owners.some((pattern) => paths.some((path) => pattern.test(path)))) return true;
+  }
+  return false;
+}
+
 /** A requirement's subject is touched when the changed text contains one of
- * its multi-word terms, or at least two of its single-word terms (joined
- * forms like `sourceSha` / `source_sha` count). Bounded heuristic, like
- * `enforcementPredicateFound`. */
+ * its multi-word phrases (in any spelling) or one of its distinctive
+ * identifier-shaped terms. Two plain words like `docs` and `repo` are
+ * deliberately NOT enough — see `requirementSubjectSignals`. Bounded
+ * heuristic, like `enforcementPredicateFound`. */
 function subjectTouched(text: string, changed: string): boolean {
-  const variants = (term: string): string[] => [term, term.replace(/ /g, ""), term.replace(/ /g, "_"), term.replace(/ /g, "-")];
-  const hits = extractRequirementTerms(text).filter((term) => variants(term).some((v) => changed.includes(v)));
-  if (hits.some((term) => term.includes(" "))) return true;
-  return new Set(hits).size >= 2;
+  const { phrases, strongTerms } = requirementSubjectSignals(text);
+  if (phrases.some((words) => phraseMatched(words, changed))) return true;
+  return strongTerms.some((term) => termWordMatch(term, changed));
 }
 
 export interface RequirementTraceScope {
@@ -382,21 +508,35 @@ export interface RequirementTraceScope {
   outOfScope: { entry: TracedLedgerEntry; reason: string }[];
 }
 
-/** #935: which requirements the trace demands. A linked-issue requirement
- * (what the PR was asked to deliver, #874), an entry without provenance, and
- * any requirement whose subject the change touches are in scope; a
+/** #935/#958: which requirements the trace demands. A linked-issue
+ * requirement (what the PR was asked to deliver, #874), an entry without
+ * provenance, any requirement whose subject the change touches, and any
+ * requirement whose declared owner path the change modifies are in scope; a
  * standards / PR-body / harness requirement the change never touches is out
  * of scope and is dispositioned `not_applicable` with a reason. Without
- * changed text every entry stays in scope (fail closed). */
-export function requirementTraceScope(ledger: unknown, changed?: string): RequirementTraceScope {
+ * changed text every entry stays in scope (fail closed). #957 tightened the
+ * subject test: only a multi-word phrase or an identifier-shaped single term
+ * counts, so unrelated standards can no longer ride in on generic vocabulary
+ * shared with every diff. #958 adds explicit `ownership` (from repository
+ * config) so a change to a boundary's own file scopes its requirement in
+ * even when the diff repeats none of its prose. */
+export function requirementTraceScope(
+  ledger: unknown,
+  changed?: string,
+  context: { ownership?: readonly RequirementOwnership[] | undefined; paths?: readonly string[] | undefined } = {},
+): RequirementTraceScope {
+  const ownership = context.ownership ?? [];
+  const paths = context.paths ?? [];
+  const compiledOwnership = ownership.length > 0 && paths.length > 0 ? compileOwnership(ownership) : [];
   const scope: RequirementTraceScope = { inScope: [], outOfScope: [] };
   for (const { entry, sources } of ledgerTraceCandidates(ledger)) {
-    if (changed === undefined || sources === null || sources.includes("linked_issues") || subjectTouched(entry.text, changed)) {
+    const owned = compiledOwnership.length > 0 && ownershipTouched(compiledOwnership, entry.text, paths);
+    if (changed === undefined || sources === null || sources.includes("linked_issues") || subjectTouched(entry.text, changed) || owned) {
       scope.inScope.push(entry);
     } else {
       scope.outOfScope.push({
         entry,
-        reason: `out of scope: from ${[...new Set(sources)].join("/")}, and none of its subject terms appear in the changed files or lines`,
+        reason: `out of scope: from ${[...new Set(sources)].join("/")}, and neither its subject terms nor any declared owner path appear in the changed files or lines`,
       });
     }
   }
@@ -436,8 +576,9 @@ export function validateRequirementTrace(
   ledger: unknown,
   workspace: string,
   changed?: string,
+  context: { ownership?: readonly RequirementOwnership[] | undefined; paths?: readonly string[] | undefined } = {},
 ): RequirementTraceArtifact {
-  const { inScope, outOfScope } = requirementTraceScope(ledger, changed);
+  const { inScope, outOfScope } = requirementTraceScope(ledger, changed, context);
   if (inScope.length === 0 && outOfScope.length === 0) {
     return { version: ARTIFACT_VERSION, rows: [], incomplete: false, errors: [] };
   }
@@ -659,12 +800,24 @@ export interface RequirementTraceEnforcementResult {
  */
 export function applyRequirementTraceEnforcement(
   artifact: ReviewArtifact,
-  options: { enabled: boolean; ledger: unknown; workspace: string; changed?: string | undefined },
+  options: {
+    enabled: boolean;
+    ledger: unknown;
+    workspace: string;
+    changed?: string | undefined;
+    /** #958 explicit boundary ownership (repository config). */
+    ownership?: readonly RequirementOwnership[] | undefined;
+    /** Changed file paths, for owner-glob matching. */
+    paths?: readonly string[] | undefined;
+  },
 ): RequirementTraceEnforcementResult {
   if (!options.enabled) {
     return { applied: false, trace: { version: ARTIFACT_VERSION, rows: [], incomplete: false, errors: [] }, findingsAdded: 0 };
   }
-  const trace = validateRequirementTrace(artifact.requirement_coverage, options.ledger, options.workspace, options.changed);
+  const trace = validateRequirementTrace(artifact.requirement_coverage, options.ledger, options.workspace, options.changed, {
+    ownership: options.ownership,
+    paths: options.paths,
+  });
   if (trace.rows.length === 0) {
     return { applied: false, trace, findingsAdded: 0 };
   }

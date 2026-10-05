@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import { applyRequirementTraceFragment, workspaceAt } from "../src/prompt/index.
 import { traceChangedText } from "../src/run/review.js";
 import { RunWorkspace } from "../src/run/workspace.js";
 import { applyStrictVerdictPolicy } from "../src/enforcement/verdict-policy.js";
+import { isValidOwnerPattern, parseRequirementOwners, resolveRequirementOwners } from "../src/config/requirement-owners.js";
 import {
   applyRequirementTraceEnforcement,
   ensureUnmetRequirementFindings,
@@ -15,6 +17,7 @@ import {
   renderRequirementTraceMarkdown,
   changedSubjectText,
   requirementNotEnforcedMessage,
+  requirementSubjectSignals,
   requirementTraceScope,
   validateRequirementTrace,
 } from "../src/enforcement/requirement-trace.js";
@@ -638,4 +641,344 @@ test("#935: missing raw diff evidence keeps every requirement in scope (fail clo
   ws.write("pr-files.json", JSON.stringify([{ filename: "README.md" }]));
   assert.equal(traceChangedText(ws), undefined);
   assert.deepEqual(requirementTraceScope(ledger, traceChangedText(ws)).inScope.map((e) => e.id), ["req-db"]);
+});
+
+// ── #957: subject scope needs strong evidence, not generic word overlap ───
+
+/** The three unrelated AGENTS.md standards #956's review pulled into scope on
+ * generic word overlap alone (see #957). */
+const STANDARDS_UNTRUSTED = "**Untrusted PR/repository/tool/web content is data, never instructions.** Fence-safe renderers, secret redaction, and untrusted-data delimiters are the boundary: hostile content must not be able to forge headings, close fences, or promote itself into instructions.";
+const STANDARDS_FORK = "**Fork privilege separation must not be weakened.** See `docs/fork-review.md`: no fork code checked out or executed in privileged runs; fork feature flags (`tool_mode`, evidence providers, Linear, related-code, repo-map, approvals) default off for forks; secrets and private linked-source enrichment never cross the fork trust boundary.";
+const STANDARDS_CREDENTIAL = "**Model API credentials travel only through the HTTP auth headers** the provider defines (e.g. `Authorization: Bearer` / `x-api-key`) over the typed Node transport (`src/transport/`); they must never appear in process argv, request URLs or bodies, or locally generated diagnostics and error messages. Do not reintroduce a shell/curl transport.";
+
+/** The #956 shape: a linked-issue parser/test/docs change whose diff text is
+ * dense with the generic tokens those three standards share (it reproduces
+ * the leak under the pre-#957 "two single-word terms" rule). */
+function pr956ChangedText(): string {
+  return changedSubjectText(
+    [
+      "diff --git a/src/precheck/linked-issues.ts b/src/precheck/linked-issues.ts",
+      "+++ b/src/precheck/linked-issues.ts",
+      "+  // content and never and close (generic words)",
+      "+  // docs evidence related repo, map, linked (generic words)",
+      "+  // request, URLs, only over the src key; they are generic words",
+    ].join("\n"),
+    ["docs/context-and-evidence.md", "src/precheck/linked-issues.ts", "tests-v3/precheck.test.ts"],
+  );
+}
+
+test("#957: the #956 linked-issue change does not scope unrelated AGENTS standards in", () => {
+  const workspace = makeWorkspace();
+  try {
+    writeFile(workspace, "src/precheck/linked-issues.ts", [
+      "export function isAddressesRef(text) {",
+      "  if (!text.includes('addresses')) throw new Error('not an implementation ref');",
+      "}",
+    ]);
+    const ledger = { requirements: [
+      { id: "req-issue", text: "Linked-issue extraction MUST recognize Addresses as a non-closing reference.", kind: "acceptance", provenance: [{ source: "linked_issues", ref: "#953", line: 1 }] },
+      { id: "req-untrusted", text: STANDARDS_UNTRUSTED, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 1 }] },
+      { id: "req-fork", text: STANDARDS_FORK, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 2 }] },
+      { id: "req-credential", text: STANDARDS_CREDENTIAL, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 3 }] },
+    ] };
+    const changed = pr956ChangedText();
+    // The #956 changed files, with the full owner map applied: the owner
+    // mechanism must not widen scope back onto the three unrelated standards.
+    const changedPaths = ["docs/context-and-evidence.md", "src/precheck/linked-issues.ts", "tests-v3/precheck.test.ts"];
+
+    const scope = requirementTraceScope(ledger, changed, { ownership: OWNERSHIP, paths: changedPaths });
+    assert.deepEqual(scope.inScope.map((e) => e.id), ["req-issue"], "only the linked-issue requirement is in scope");
+    assert.deepEqual(scope.outOfScope.map((o) => o.entry.id).sort(), ["req-credential", "req-fork", "req-untrusted"]);
+
+    // With the linked-issue requirement satisfied, the unrelated standards are
+    // grounded not_applicable and coverage stays complete — no approval
+    // withholding from generic word overlap alone.
+    const claims = [{
+      requirement_id: "req-issue",
+      disposition: "met",
+      enforcement: [{ file: "src/precheck/linked-issues.ts", line: 2 }],
+      test: [VALID_TEST_LOCATION],
+      reason: "the parser's implementation-ref predicate matches Addresses",
+    }];
+    const trace = validateRequirementTrace(claims, ledger, workspace, changed, { ownership: OWNERSHIP, paths: changedPaths });
+    assert.equal(trace.incomplete, false);
+    assert.equal(trace.rows.find((r) => r.requirement_id === "req-issue")?.disposition, "met");
+    for (const id of ["req-untrusted", "req-fork", "req-credential"]) {
+      const row = trace.rows.find((r) => r.requirement_id === id);
+      assert.equal(row?.disposition, "not_applicable", id);
+      assert.ok(row?.notes.includes("out-of-scope"), id);
+      assert.match(row?.reason ?? "", /^out of scope: from standards/, id);
+    }
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+/** The declared owner map a repository config would carry (#958): architectural
+ * metadata, not an inferred lexical signal. */
+const OWNERSHIP = [
+  { match: ["fork", "privilege", "separation"], owners: [".github/workflows/fork-ai-review.yaml", "scripts/fork_review_gate.py"] },
+  { match: ["untrusted", "content", "data"], owners: ["src/context/pr-thread.ts", "src/context/review-threads.ts", "src/specialists/render.ts", "src/claims/render.ts", "src/requirements/ledger.ts", "src/publish/publish.ts"] },
+  { match: ["model", "api", "credentials"], owners: ["src/transport/http.ts", "src/transport/sse.ts", "src/transport/transport.ts"] },
+];
+
+test("#958: a declared owner path scopes its requirement in; unrelated paths do not", () => {
+  const ledger = { requirements: [
+    { id: "req-fork", text: STANDARDS_FORK, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 2 }] },
+    { id: "req-untrusted", text: STANDARDS_UNTRUSTED, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 1 }] },
+    { id: "req-credential", text: STANDARDS_CREDENTIAL, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 3 }] },
+  ] };
+  const scope = (paths: string[]): string[] =>
+    requirementTraceScope(ledger, changedSubjectText("+  const x = 1;\n", paths), { ownership: OWNERSHIP, paths }).inScope.map((e) => e.id).sort();
+
+  // The fork-privilege standard guards .github/workflows/fork-ai-review.yaml:
+  // ordinary workflow edits there need not repeat "fork privilege" or
+  // "trust boundary", but the declared owner path keeps it in scope — and it
+  // scopes only that standard.
+  assert.deepEqual(scope([".github/workflows/fork-ai-review.yaml"]), ["req-fork"]);
+  assert.deepEqual(scope(["scripts/fork_review_gate.py"]), ["req-fork"]);
+  // The untrusted-content boundary's fence renderers own it.
+  assert.deepEqual(scope(["src/specialists/render.ts"]), ["req-untrusted"]);
+  // An unrelated workflow is not an owner.
+  assert.deepEqual(scope([".github/workflows/foo.yaml"]), []);
+  // A path that merely contains `model` is not an owner of the credential
+  // standard, and generic overlap alone must not scope it in.
+  assert.deepEqual(scope(["src/model/foo.ts"]), []);
+});
+
+test("#958: a narrow owner glob matches; a broad pattern is rejected at parse time", () => {
+  const parsed = parseRequirementOwners(
+    "requirements:\n  untrusted-content-is-data:\n    owners:\n      - src/context/*-thread.ts\n",
+    ".github/pr-reviewer-owners.yml",
+  );
+  assert.ok(!("malformed" in parsed));
+  if ("malformed" in parsed) return;
+  const ledger = { requirements: [{ id: "req-u", text: STANDARDS_UNTRUSTED, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 1 }] }] };
+  const changed = changedSubjectText("+x\n", ["src/context/pr-thread.ts"]);
+  assert.deepEqual(requirementTraceScope(ledger, changed, { ownership: parsed.rules, paths: ["src/context/pr-thread.ts"] }).inScope.map((e) => e.id), ["req-u"]);
+});
+
+test("#958: parseRequirementOwners accepts a valid map and drops invalid owner globs", () => {
+  const text = [
+    "requirements:",
+    "  fork-privilege-separation:",
+    "    owners:",
+    "      - .github/workflows/fork-ai-review.yaml",
+    "      - scripts/fork_review_gate.py",
+    "  untrusted-content-is-data:",
+    "    owners:",
+    "      - src/specialists/render.ts",
+    "      - src/**",
+    "      - /etc/passwd",
+    "      - ../escape.ts",
+    "      - '*.ts'",
+  ].join("\n");
+  const parsed = parseRequirementOwners(text, ".github/pr-reviewer-owners.yml");
+  assert.ok(!("malformed" in parsed));
+  if ("malformed" in parsed) return;
+  assert.deepEqual(parsed.rules, [
+    { match: ["fork", "privilege", "separation"], owners: [".github/workflows/fork-ai-review.yaml", "scripts/fork_review_gate.py"] },
+    { match: ["untrusted", "content", "data"], owners: ["src/specialists/render.ts"] },
+  ]);
+  assert.ok(parsed.warnings.length >= 4, JSON.stringify(parsed.warnings));
+});
+
+test("#958: parseRequirementOwners never throws and degrades malformed input to no owners", () => {
+  assert.deepEqual(parseRequirementOwners("", "p"), { rules: [], warnings: [] });
+  assert.ok("malformed" in parseRequirementOwners("a: [1, 2", "p"), "invalid YAML is malformed");
+  assert.ok("malformed" in parseRequirementOwners("- a\n- b", "p"), "a non-mapping file is malformed");
+  assert.ok("malformed" in parseRequirementOwners("requirements: [1, 2]", "p"), "a non-mapping section is malformed");
+  // A missing section is not malformed — just no owners.
+  const noSection = parseRequirementOwners("other: 1", "p");
+  assert.ok(!("malformed" in noSection));
+  if ("malformed" in noSection) return;
+  assert.deepEqual(noSection.rules, []);
+  assert.equal(noSection.warnings.length, 1);
+});
+
+test("#958: isValidOwnerPattern rejects broad, escaping, or backtracking globs", () => {
+  assert.equal(isValidOwnerPattern("src/context/pr-thread.ts"), true);
+  assert.equal(isValidOwnerPattern("src/context/*-thread.ts"), true);
+  assert.equal(isValidOwnerPattern("src/transport/*.ts"), true);
+  assert.equal(isValidOwnerPattern("src/**"), false);
+  assert.equal(isValidOwnerPattern("src/**/*.ts"), false);
+  assert.equal(isValidOwnerPattern("/abs/path.ts"), false);
+  assert.equal(isValidOwnerPattern("../escape.ts"), false);
+  assert.equal(isValidOwnerPattern("*.ts"), false); // no directory component
+  assert.equal(isValidOwnerPattern("*/foo.ts"), false); // all-wildcard segment
+  assert.equal(isValidOwnerPattern("src/*/*.ts"), false); // all-wildcard segment
+  assert.equal(isValidOwnerPattern("src/a*b*c.ts"), false); // >1 `*` backtracks
+  assert.equal(isValidOwnerPattern("src/ spaced.ts"), false); // whitespace
+  assert.equal(isValidOwnerPattern("a//b.ts"), false);
+  assert.equal(isValidOwnerPattern(""), false);
+});
+
+test("#958: parseRequirementOwners warns on a non-slug key and an over-long owners list", () => {
+  const parsed = parseRequirementOwners(
+    [
+      "requirements:",
+      "  fork_privilege_separation:",
+      "    owners:",
+      "      - .github/workflows/fork-ai-review.yaml",
+      "  untrusted-content-is-data:",
+      "    owners:",
+      ...Array.from({ length: 40 }, (_unused, i) => `      - src/file-${i}.ts`),
+    ].join("\n"),
+    "p",
+  );
+  assert.ok(!("malformed" in parsed));
+  if ("malformed" in parsed) return;
+  // The underscore key is dropped; the valid rule keeps only the 32-owner cap.
+  assert.deepEqual(parsed.rules.map((r) => r.match.join("-")), ["untrusted-content-data"]);
+  assert.equal(parsed.rules[0]!.owners.length, 32);
+  assert.ok(parsed.warnings.some((w) => w.includes("hyphenated slug")), JSON.stringify(parsed.warnings));
+  assert.ok(parsed.warnings.some((w) => w.includes("more than 32 owners")), JSON.stringify(parsed.warnings));
+});
+
+test("#958: a malformed ownership context cannot crash the trace scope", () => {
+  const ledger = { requirements: [{ id: "r", text: STANDARDS_FORK, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 1 }] }] };
+  const changed = changedSubjectText("+x\n", [".github/workflows/fork-ai-review.yaml"]);
+  // A non-string token (which the parser never produces) must be dropped, not throw.
+  assert.doesNotThrow(() =>
+    requirementTraceScope(ledger, changed, { ownership: [{ match: [42] as never, owners: [".github/workflows/fork-ai-review.yaml"] }], paths: [".github/workflows/fork-ai-review.yaml"] }),
+  );
+});
+
+test("#958: resolveRequirementOwners degrades to no owners on an unresolvable ref", () => {
+  // Exercises the real git-backed reader's failure path: never throws, never
+  // broadens scope, and surfaces a warning.
+  const result = resolveRequirementOwners({ baseRef: "definitely-not-a-real-ref-958", workspace: process.cwd() });
+  assert.deepEqual(result.rules, []);
+  assert.equal(result.warnings.length, 1);
+  assert.equal(result.sourcePath, null);
+});
+
+test("#958: the owner map is read from the base commit, not the PR head", () => {
+  // The trust property the whole mechanism rests on: a PR must not be able to
+  // edit the ownership metadata used to review itself. Base commit A, head
+  // replaces it with B (then deletes it); the resolver called with the base
+  // SHA must return A regardless of the working tree / head state.
+  const repo = mkdtempSync(join(tmpdir(), "req-owners-git-"));
+  const git = (...args: string[]): string =>
+    execFileSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", ...args], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+    }).toString();
+  const writeMap = (owners: string): void => {
+    mkdirSync(join(repo, ".github"), { recursive: true });
+    writeFileSync(join(repo, ".github", "pr-reviewer-owners.yml"), owners);
+  };
+  const expected = (owner: string): unknown => [{ match: ["fork", "privilege", "separation"], owners: [owner] }];
+  try {
+    git("init", "-q");
+    writeMap("requirements:\n  fork-privilege-separation:\n    owners:\n      - .github/workflows/base-only.yaml\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "base");
+    const baseSha = git("rev-parse", "HEAD").trim();
+
+    // The PR head replaces the owner map with a different one...
+    writeMap("requirements:\n  fork-privilege-separation:\n    owners:\n      - .github/workflows/head-only.yaml\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "head");
+    const headSha = git("rev-parse", "HEAD").trim();
+
+    // ...and a later commit removes it entirely.
+    git("rm", "-q", ".github/pr-reviewer-owners.yml");
+    git("commit", "-q", "-m", "delete");
+    const deletedSha = git("rev-parse", "HEAD").trim();
+
+    // The working tree is at head; reading the base ref must still yield the
+    // base map — never the head's replacement or its deletion.
+    assert.deepEqual(resolveRequirementOwners({ baseRef: baseSha, workspace: repo }).rules, expected(".github/workflows/base-only.yaml"));
+    // Sanity: the resolver really does read the ref it is given.
+    assert.deepEqual(resolveRequirementOwners({ baseRef: headSha, workspace: repo }).rules, expected(".github/workflows/head-only.yaml"));
+    // A ref where the file is absent is genuine absence, not a head injection.
+    const deleted = resolveRequirementOwners({ baseRef: deletedSha, workspace: repo });
+    assert.deepEqual(deleted.rules, []);
+    assert.equal(deleted.sourcePath, null);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("#957: weak generic-token overlap alone cannot scope a standards requirement in", () => {
+  // None of these words is on the issue's example list — a fix that merely
+  // appended docs/repo/request/only/never to a stoplist would still leak.
+  const ledger = { requirements: [
+    { id: "req-generic", text: "The manifest provider MUST emit release data.", kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 9 }] },
+  ] };
+  const changed = changedSubjectText("+  const manifest = load();\n+  const provider = pick();\n+  const data = emit();\n", ["src/manifest.ts"]);
+  const scope = requirementTraceScope(ledger, changed);
+  assert.deepEqual(scope.inScope, []);
+  assert.deepEqual(scope.outOfScope.map((o) => o.entry.id), ["req-generic"]);
+});
+
+test("#957: strong subject overlap still scopes an applicable standards requirement in", () => {
+  const scoped = (id: string, text: string, changed: string): string[] =>
+    requirementTraceScope({ requirements: [{ id, text, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 1 }] }] }, changed).inScope.map((e) => e.id);
+
+  // A distinctive multi-word concept.
+  assert.deepEqual(
+    scoped("req-trust", "The fork trust boundary MUST be enforced at the transport seam.", changedSubjectText("+  if (!withinTrustBoundary(fork)) throw new Error('x');\n", ["src/platform/fork.ts"])),
+    ["req-trust"],
+  );
+  // A single identifier-shaped term: an internal capital, a digit-bearing
+  // token long enough not to be a version fragment, or an acronym-prefixed
+  // identifier.
+  assert.deepEqual(
+    scoped("req-sha", "The resolved context MUST compare sourceSha against the head.", changedSubjectText("+  if (record.sourceSha !== ctx.sourceSha) {\n", ["src/context.ts"])),
+    ["req-sha"],
+  );
+  assert.deepEqual(
+    scoped("req-digest", "The digest MUST be sha256.", changedSubjectText("+  const digest = sha256(bytes);\n", ["src/digest.ts"])),
+    ["req-digest"],
+  );
+  assert.deepEqual(
+    scoped("req-sqlite", "The ledger MUST persist in SQLite.", changedSubjectText("+  const db = new SQLiteStore(path);\n", ["src/requirements/sqlite-store.ts"])),
+    ["req-sqlite"],
+  );
+});
+
+test("#957: a phrase does not match inside a longer word", () => {
+  const ledger = { requirements: [
+    { id: "req-untrusted", text: STANDARDS_UNTRUSTED, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 1 }] },
+  ] };
+  // The untrusted-content standard's "data never" bigram must not match
+  // `metadata never` (a bare-substring phrase path would).
+  assert.deepEqual(requirementTraceScope(ledger, changedSubjectText("+  // the sandbox guarantees metadata never leaves the container\n", ["src/sandbox.ts"])).inScope, []);
+  // A whole-word phrase still counts.
+  assert.deepEqual(requirementTraceScope(ledger, changedSubjectText("+  // data never leaves the container\n", ["src/sandbox.ts"])).inScope.map((e) => e.id), ["req-untrusted"]);
+});
+
+test("#957: bare acronyms and short version fragments are not distinctive on their own", () => {
+  const scoped = (id: string, text: string, changed: string): string[] =>
+    requirementTraceScope({ requirements: [{ id, text, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 4 }] }] }, changed).inScope.map((e) => e.id);
+  assert.deepEqual(scoped("req-urls", "Request URLs MUST be validated.", changedSubjectText("+  // CSS/JS URLs covered by closed #479\n", ["src/a.ts"])), []);
+  assert.deepEqual(scoped("req-v3", "The v3 public contract MUST use kebab-case names.", changedSubjectText("+  // tests-v3 and contracts/action-v3.yml\n", ["tests-v3/requirement-trace.test.ts"])), []);
+});
+
+test("#957: a path-shaped phrase still scopes in, and an oversized word cannot crash scope", () => {
+  const scoped = (id: string, text: string, changed: string): string[] =>
+    requirementTraceScope({ requirements: [{ id, text, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 1 }] }] }, changed).inScope.map((e) => e.id);
+  // A slash-joined path phrase (`src/transport`) is genuine subject overlap.
+  assert.deepEqual(
+    scoped("req-transport", "Code under src/transport keeps credentials out of argv.", changedSubjectText("+  export const x = 1;\n", ["src/transport/http.ts"])),
+    ["req-transport"],
+  );
+  // A pathological word must not make `new RegExp` throw (the module contract
+  // is to never throw on malformed input).
+  const long = "x".repeat(20_000);
+  assert.doesNotThrow(() =>
+    requirementTraceScope(
+      { requirements: [{ id: "req-long", text: `${long} ${long} MUST hold.`, kind: "normative", provenance: [{ source: "standards", ref: "AGENTS.md", line: 1 }] }] },
+      changedSubjectText("+  const y = 1;\n", ["src/a.ts"]),
+    ),
+  );
+});
+
+test("#957: requirementSubjectSignals separates phrases from identifier-shaped terms", () => {
+  const signals = requirementSubjectSignals("Fork trust boundary and sourceSha and p0 and SQLite and PR and URLs.");
+  assert.deepEqual(signals.strongTerms, ["sourcesha", "sqlite"]);
+  assert.deepEqual(signals.phrases.map((p) => p.join(" ")), ["Fork trust", "trust boundary"]);
 });
