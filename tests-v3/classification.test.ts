@@ -1072,17 +1072,291 @@ test("#749: lexical material classes need executable context", () => {
     const result = classifyPr({ prFiles: files(filename), diffText: diff, linkedIssues: [] });
     assert.equal(result.prKind, "path_handling_changes", diff);
   }
-  // Other classes keep their existing semantics: traversal literals and
-  // archive operations are meaningful even in comments and docs.
+  // #960: a comment is not executable, so the non-lexical classes no longer
+  // fire from a comment-only mention either — the neutralizer blanks comment
+  // spans before every content class scans. This is a deliberate spec change:
+  // this block previously asserted that `+# blocks ../traversal` and
+  // `+# uses extractall` FIRE. The decision stays visible as a discounted
+  // `diff_comment` signal, never a silent drop.
+  const commentNeutralized: [string, string, string][] = [
+    ["+# blocks ../traversal\n", "src/app.py", "traversal_literal"],
+    ["+# uses extractall\n", "src/app.py", "archive_extraction"],
+    ["+// see ../etc/passwd\n", "src/app.ts", "traversal_literal"],
+  ];
+  for (const [diff, filename, signal] of commentNeutralized) {
+    const result = classifyPr({ prFiles: files(filename), diffText: diff, linkedIssues: [] });
+    assert.equal(result.prKind, "app_code", diff);
+    assert.equal(result.pathHandlingProvenance.fired, false, diff);
+    assert.ok(
+      result.pathHandlingProvenance.discounted.some((s) => s.signal === signal && s.source === "diff_comment"),
+      `${diff}: expected a discounted ${signal} signal, got ${JSON.stringify(result.pathHandlingProvenance.discounted)}`,
+    );
+  }
+  // A documentation FILE is prose, not a comment: a doc line that names a
+  // real traversal keeps its existing semantics.
   const preserved: [string, string][] = [
-    ["+# blocks ../traversal\n", "src/app.py"],
     ["+see ../etc/passwd\n", "README.md"],
-    ["+# uses extractall\n", "src/app.py"],
   ];
   for (const [diff, filename] of preserved) {
     const result = classifyPr({ prFiles: files(filename), diffText: diff, linkedIssues: [] });
     assert.equal(result.prKind, "path_handling_changes", diff);
   }
+});
+
+// ── #960: a `../` module reference in a doc comment is not traversal ──────
+
+test("#960: a `../` that appears only in a comment or doc comment is not a traversal literal", () => {
+  const negatives: [string, string][] = [
+    // The #947 repro: a JSDoc continuation line carries no marker of its own,
+    // so only block-comment state can recognize it.
+    [
+      "+/**\n+ * The job a canonical forge event (`../events/types.js`) can spawn: the\n+ */\n",
+      "src/jobs/types.ts",
+    ],
+    // A backtick-quoted module reference in a `#` comment.
+    ["+# See `../events/types.js` for the shape.\n", "src/jobs/types.py"],
+    // ... in a `--` comment.
+    ["+-- see ../events/types.js for the shape\n", "src/jobs/query.lua"],
+    // ... in a `//` line comment.
+    ["+// see ../events/types.js for the shape\n", "src/jobs/types.ts"],
+    // ... and in a one-line block comment.
+    ["+/* see ../events/types.js */\n", "src/jobs/types.ts"],
+    // A plain multi-line block comment with no space after the opener, and a
+    // mid-line opener: both are real comments, not phantom blocks.
+    ["+/*hello world\n+see ../events/types.js\n+*/\n", "src/jobs/types.ts"],
+    ["+func() /*\n+see ../events/types.js\n+*/\n", "src/jobs/types.ts"],
+    // An unspaced marker right after a statement terminator is still a comment.
+    ["+x=1;//see ../events/types.js\n", "src/jobs/types.ts"],
+    ["+x=1;#see ../events/types.js\n", "src/jobs/types.py"],
+    // An unspaced `//` is a comment: its non-comment uses always sit against a
+    // non-space character, which the preceding-character rule already refuses.
+    ["+//see ../events/types.js\n", "src/jobs/types.ts"],
+    // In a block-comment language a `/*` glued to a preceding token is still a
+    // comment opener (C maximal munch), so it is blanked like any other.
+    ["+a/*see ../events/types.js\n+*/\n", "src/jobs/types.ts"],
+    ["+x=1/*see ../events/types.js\n+*/\n", "src/jobs/types.ts"],
+  ];
+  for (const [diff, filename] of negatives) {
+    const result = classifyPr({ prFiles: files(filename), diffText: diff, linkedIssues: [] });
+    assert.equal(result.prKind, "app_code", diff);
+    assert.ok(!result.riskFlags.includes("path_handling_changes"), diff);
+    assert.equal(result.pathHandlingProvenance.fired, false, diff);
+    // The decision is recorded, not silently dropped.
+    assert.ok(
+      result.pathHandlingProvenance.discounted.some(
+        (s) => s.signal === "traversal_literal" && s.source === "diff_comment",
+      ),
+      `${diff}: expected a discounted traversal_literal, got ${JSON.stringify(result.pathHandlingProvenance.discounted)}`,
+    );
+  }
+});
+
+test("#960: a traversal literal in real code still fires, including next to an import and past a string-literal marker", () => {
+  const positives: [string, string][] = [
+    // Plain code, no comment anywhere.
+    ["+const p = path.join(base, '../../etc/passwd');\n", "src/app.ts"],
+    // Same line as an import specifier: the specifier is neutralized, the real
+    // traversal is not.
+    ['+import { a } from "../lib"; fs.readFileSync("../../etc/passwd");\n', "src/app.ts"],
+    // Adversarial (#252): the `//` inside the string literal is data, not a
+    // comment marker — it must not truncate the line and hide the traversal.
+    ['+const url = "https://example.com"; fs.readFileSync("../../etc/passwd");\n', "src/app.ts"],
+    // Adversarial: a `#` inside a string literal must not comment out the code
+    // that follows it.
+    ['+const tag = "#heading"; p = open("../../etc/passwd")\n', "src/app.py"],
+    // A real comment on the same line as code leaves the code intact.
+    ['+x = 1  # note: see ../docs\n+with open("../../etc/passwd") as fh:\n', "src/app.py"],
+    // `--` that is a decrement, not a comment marker.
+    ['+i--; fs.readFileSync("../../etc/passwd");\n', "src/app.ts"],
+    // A CSS hex colour is not a `#` comment: the relative url() is real.
+    ["+background: #fff url(../../img/bg.png);\n", "src/styles/app.css"],
+    // An unspaced floor division is not a `//` comment.
+    ['+n = total//count; p = open("../../etc/passwd")\n', "src/app.py"],
+    // An unquoted URL's `//` is not a comment marker.
+    ['+const url = http://host/x; p = open("../../etc/passwd")\n', "src/app.py"],
+    // An escaped slash in a regex literal is not a comment marker.
+    ['+const re = /a\\//; p = fs.readFileSync("../../etc/passwd");\n', "src/app.ts"],
+    // A shell glob is not a block comment — shell has none. `/*` must not
+    // blank the real traversal that follows it, no closer or closer found.
+    ['+rm -rf /*\n+const p = fs.readFileSync("../../etc/passwd");\n', "scripts/build.sh"],
+    // ... and a glob whose `/*` is followed by more glob text is no different:
+    // the phantom cannot pair with the closing marker inside the string.
+    ['+rm -rf /*foo\n+cp ../../etc/passwd .\n+echo "*/"\n', "scripts/build.sh"],
+    // `--` is not a comment marker in shell: it ends the options, and the
+    // traversal after it is real code.
+    ['+cp -- ../../etc/passwd ./dest\n', "scripts/build.sh"],
+    // `//` is not a comment marker in Python: spaced floor division is code.
+    ['+chunk = total // workers; save("../etc/passwd")\n', "src/jobs/stats.py"],
+    // An unknown file type gets no comment blanking at all: with no language
+    // there is no basis for treating any marker as a comment.
+    ["+/* note: see ../events/types.js */\n", "jobs/config.weird"],
+    // Markup has no `//` comment: a `//` in HTML text is data, and blanking
+    // it would hide the traversal that follows.
+    ["+<p>note: // see ../../etc/passwd for details</p>\n", "src/page.html"],
+    // `#` is not a comment marker in C: a spaced preprocessor directive is
+    // code, and its macro body is a real path reference.
+    ["+# define DATA_DIR ../etc\n", "src/app.c"],
+    // A real one-line comment whose quoted closing marker is followed by code:
+    // quotes have no syntax inside a comment, so the FIRST closing marker
+    // closes it and the code after it is scanned as code.
+    ['+/* "*/ const p = fs.readFileSync("../../etc/passwd"); /* "*/\n', "src/app.ts"],
+    // A block comment that documents the delimiter is cut short at the quoted
+    // closing marker, exactly as C/JS/CSS lexes it — its tail is code, and the
+    // traversal there must fire.
+    ['+/* The token is "*/" and then\n+ * see ../events/types.js\n+ */\n', "src/jobs/types.ts"],
+  ];
+  for (const [diff, filename] of positives) {
+    const result = classifyPr({ prFiles: files(filename), diffText: diff, linkedIssues: [] });
+    assert.equal(result.prKind, "path_handling_changes", diff);
+    assert.ok(result.riskFlags.includes("path_handling_changes"), diff);
+    assert.ok(
+      result.pathHandlingProvenance.signals.some((s) => s.signal === "traversal_literal"),
+      `${diff}: expected a fired traversal_literal, got ${JSON.stringify(result.pathHandlingProvenance.signals)}`,
+    );
+  }
+});
+
+test("#960: block-comment state is tracked per diff stream, so it never hides real code", () => {
+  // A removed line that opens a block comment must not blank an added line's
+  // real traversal — a false negative would be worse than the false positive
+  // this change fixes.
+  const removedOpener = classifyPr({
+    prFiles: files("src/app.ts"),
+    diffText: '-/* legacy note about ../old\n+const p = fs.readFileSync("../../etc/passwd");\n',
+    linkedIssues: [],
+  });
+  assert.equal(removedOpener.prKind, "path_handling_changes");
+  assert.ok(removedOpener.pathHandlingProvenance.signals.some((s) => s.signal === "traversal_literal"));
+
+  // The mirror case: an ADDED opener blanks a context continuation line, which
+  // sits inside the block in the new file. Both are the new-file stream.
+  const addedOpener = classifyPr({
+    prFiles: files("src/app.ts"),
+    diffText: '+/*\n const p = fs.readFileSync("../../etc/passwd");\n+*/\n',
+    linkedIssues: [],
+  });
+  assert.equal(addedOpener.prKind, "app_code");
+  assert.equal(addedOpener.pathHandlingProvenance.fired, false);
+
+  // A regex literal's `/*` is not a block opener: it must not open a phantom
+  // block and swallow the real traversal on the next line.
+  const regexLiteral = classifyPr({
+    prFiles: files("src/app.ts"),
+    diffText: '+const re = /\\/*foo\\//g;\n+const p = fs.readFileSync("../../etc/passwd");\n',
+    linkedIssues: [],
+  });
+  assert.equal(regexLiteral.prKind, "path_handling_changes");
+  assert.ok(regexLiteral.pathHandlingProvenance.signals.some((s) => s.signal === "traversal_literal"));
+
+  // A shell glob cannot open one either.
+  const glob = classifyPr({
+    prFiles: files("scripts/build.sh"),
+    diffText: "+rm -rf build/*\n+cp ../../etc/passwd .\n",
+    linkedIssues: [],
+  });
+  assert.equal(glob.prKind, "path_handling_changes");
+  assert.ok(glob.pathHandlingProvenance.signals.some((s) => s.signal === "traversal_literal"));
+});
+
+test("#960: commentFree is the sole comment authority — no downstream path re-interprets markers", () => {
+  // Spaced Python floor division is not a `//` comment: the lexical
+  // code-only class after it must still fire. The retired generic stripper
+  // truncated at the first `#`/`//` and hid `sanitize_path` behind it.
+  const floorDivision = classifyPr({
+    prFiles: files("src/jobs/stats.py"),
+    diffText: '+x = total // workers; sanitize_path(p)\n',
+    linkedIssues: [],
+  });
+  assert.equal(floorDivision.prKind, "path_handling_changes");
+  assert.ok(
+    floorDivision.pathHandlingProvenance.signals.some(
+      (s) => s.signal === "path_containment_or_sanitization",
+    ),
+    JSON.stringify(floorDivision.pathHandlingProvenance.signals),
+  );
+
+  // Same marker, same lesson, inside a construction call's operand list: the
+  // operand after the floor division is real input for untrusted_source_join.
+  const flowOperand = classifyPr({
+    prFiles: files("src/jobs/stats.py"),
+    diffText: '+dest = path.join(root, total // workers, request.args["path"])\n',
+    linkedIssues: [],
+  });
+  assert.equal(flowOperand.prKind, "path_handling_changes");
+  assert.ok(
+    flowOperand.pathHandlingProvenance.signals.some((s) => s.signal === "untrusted_source_join"),
+    JSON.stringify(flowOperand.pathHandlingProvenance.signals),
+  );
+
+  // Tcl's `#` is a comment only in command position; mid-command it is an
+  // argument, so it must not blank the traversal after it.
+  const tcl = classifyPr({
+    prFiles: files("lib/setup.tcl"),
+    diffText: "+set p [file join # ../../etc/passwd]\n",
+    linkedIssues: [],
+  });
+  assert.equal(tcl.prKind, "path_handling_changes");
+  assert.ok(tcl.pathHandlingProvenance.signals.some((s) => s.signal === "traversal_literal"));
+
+  // Dockerfile `#` is likewise position-sensitive (a comment line vs an
+  // instruction argument), so it gets no blanking either.
+  const dockerfile = classifyPr({
+    prFiles: files("deploy/Dockerfile"),
+    diffText: "+LABEL notes # see ../../etc/passwd\n",
+    linkedIssues: [],
+  });
+  assert.equal(dockerfile.prKind, "path_handling_changes");
+  assert.ok(dockerfile.pathHandlingProvenance.signals.some((s) => s.signal === "traversal_literal"));
+
+  // The cost of refusing position-sensitive `#` languages is explicit:
+  // genuine comments in Tcl and Dockerfile now fire — a false positive,
+  // which is the direction the invariant prefers.
+  const tclComment = classifyPr({
+    prFiles: files("lib/setup.tcl"),
+    diffText: "+proc foo {} {\n+    # see ../../etc/passwd\n+}\n",
+    linkedIssues: [],
+  });
+  assert.equal(tclComment.prKind, "path_handling_changes");
+  const dockerfileComment = classifyPr({
+    prFiles: files("deploy/Dockerfile"),
+    diffText: "+# build steps for ../../etc/passwd\n",
+    linkedIssues: [],
+  });
+  assert.equal(dockerfileComment.prKind, "path_handling_changes");
+
+  // jsx/tsx get no comment blanking at all: their grammar is mixed, so a
+  // `//` (or a block comment) in JSX text can be literal markup hiding real
+  // code that follows on the line. If the lightweight lexer cannot prove
+  // something is a comment, it is scanned as code — the cost is that genuine
+  // TS comments in .tsx fire, the direction the invariant prefers.
+  const jsxText = classifyPr({
+    prFiles: files("src/ui/view.tsx"),
+    diffText: '+const view = <div> // note {fs.readFileSync("../../etc/passwd")}</div>;\n',
+    linkedIssues: [],
+  });
+  assert.equal(jsxText.prKind, "path_handling_changes");
+  assert.ok(jsxText.pathHandlingProvenance.signals.some((s) => s.signal === "traversal_literal"));
+  const jsxBlock = classifyPr({
+    prFiles: files("src/ui/view.tsx"),
+    diffText: '+const v = <div> /* note */ {fs.readFileSync("../../etc/passwd")}</div>;\n',
+    linkedIssues: [],
+  });
+  assert.equal(jsxBlock.prKind, "path_handling_changes");
+  const tsxComment = classifyPr({
+    prFiles: files("src/ui/view.tsx"),
+    diffText: "+// see ../events/types.js for the shape\n",
+    linkedIssues: [],
+  });
+  assert.equal(tsxComment.prKind, "path_handling_changes");
+
+  // PHP is the same mixed-grammar class: HTML text between `?>` and `<?php`
+  // can carry a literal `//` ahead of a real PHP island on the same line.
+  const phpIsland = classifyPr({
+    prFiles: files("src/page.php"),
+    diffText: '+<div> // note <?php fopen("../etc/passwd", "r"); ?></div>\n',
+    linkedIssues: [],
+  });
+  assert.equal(phpIsland.prKind, "path_handling_changes");
 });
 
 test("#871: a bare `pathname` is a WHATWG URL component, not a path variable, unless the file also touches a filesystem/path-construction API", () => {

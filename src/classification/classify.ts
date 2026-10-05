@@ -399,14 +399,343 @@ function neutralizePathFalsePositives(
     .replace(TRUSTED_ANCHOR_TOKEN, '""');
 }
 
-function neutralizeChunkLines(lines: string[]): string[] {
+const DIFF_MARKERS: ReadonlySet<string> = new Set(["+", "-", " "]);
+
+/** The unified-diff line marker, or NUL for a header line that has none. */
+function diffMarker(line: string): string {
+  const first = line[0] ?? "";
+  return DIFF_MARKERS.has(first) ? first : "\u0000";
+}
+
+/** Characters that end a statement or expression, after which a comment marker
+ * cannot be part of a larger token (a URL scheme, a division, a regex). */
+const STATEMENT_TERMINATORS: ReadonlySet<string> = new Set([";", ")", "}", "]", ",", "{"]);
+
+/** True when a line-comment marker at index `i` is a comment rather than part
+ * of a token that merely contains the same characters. Two shapes qualify:
+ * right after a statement terminator (`x=1;// note`, `);// note`), where a URL
+ * scheme, an unspaced floor division, or an escaped regex slash is impossible;
+ * or at code start / after whitespace (`// note`, `# note`, `x = 1  # note`).
+ * `requireTrailingSpace` additionally demands whitespace or end-of-line after
+ * the marker: `#` and `--` need it (a CSS hex colour `#fff` and a
+ * pre-decrement `--i` both follow whitespace or the line start), while `//`
+ * does not (its non-comment uses — `a//b` floor division, `https://`, `/a\//`
+ * — are always attached to a non-space character). When the marker is
+ * ambiguous the text is scanned as CODE, which can only add signal, never hide
+ * it: this rule fails toward detection. */
+function commentMarkerAt(
+  chars: readonly string[],
+  i: number,
+  prefix: number,
+  length: number,
+  requireTrailingSpace: boolean,
+): boolean {
+  const prev = i > 0 ? chars[i - 1] ?? "" : "";
+  if (STATEMENT_TERMINATORS.has(prev)) return true;
+  if (i !== prefix && !/\s/.test(prev)) return false;
+  if (!requireTrailingSpace) return true;
+  const next = chars[i + length] ?? "";
+  return next === "" || /\s/.test(next);
+}
+
+/** The only `/*` refused outright as a cross-line block opener is one preceded
+ * by a backslash — the escaped slash of a regex literal (`/\*foo\//`). In a
+ * language that actually has `/*` block comments, every other `/*` outside a
+ * string IS a comment (C maximal munch makes `a/*b` a comment opener, and
+ * globs are a shell concept shell never reaches here — see
+ * `commentMarkersFor`). Whether the candidate really is a comment is then
+ * decided by `findBlockClose`: an opener with no closer is left as code rather
+ * than blanking what follows. A single-line `/* ... *​/` is blanked inline
+ * regardless, since its closer is on the same line and cannot leak. */
+function isBlockOpener(chars: readonly string[], i: number): boolean {
+  return (i > 0 ? chars[i - 1] ?? "" : "") !== "\\";
+}
+
+/** Search bound for a block comment's closer. A real comment is far shorter; a
+ * phantom opener simply fails to find one and is discarded. */
+const MAX_BLOCK_CARRY_LINES = 200;
+
+/** File-type token used to pick the comment markers: the extension after the
+ * last dot (`ts` for `src/app.ts`, `gitignore` for `.gitignore`), or the whole
+ * basename when there is no dot (`makefile`). */
+function fileKindToken(path: string): string {
+  const base = path.split("/").pop() ?? "";
+  const lower = base.toLowerCase();
+  const dot = lower.lastIndexOf(".");
+  return dot >= 0 ? lower.slice(dot + 1) : lower;
+}
+
+/** Comment syntax is a fact about the file's language, not something local
+ * syntax can decide: `rm -rf /*foo` and `x = 1 /* note` are
+ * character-identical shapes, and only the language tells them apart. A
+ * marker that is not a comment in the file's language must NEVER blank text —
+ * in shell, `/*` is a glob, `--` an end-of-options terminator
+ * (`cp -- ../etc/passwd dest`), and `//` a doubled slash or (in Python) spaced
+ * floor division (`x = total // workers; open("../out")`), so blanking there
+ * hides real code: a false negative. Unknown file types get no comment
+ * blanking at all, which also fails toward detection. `#` is gated too: it is
+ * a comment in most scripting and config languages but a preprocessor
+ * directive in C (`# define X ../y`) and an ID selector in CSS. */
+
+/** `#` line comments: shell family, Python, Ruby, Perl, and the config
+ * languages that borrow the convention. Tcl and Dockerfile are deliberately
+ * absent: there `#` is a comment only in command position (start of command /
+ * comment line), which the shared standalone-or-terminator placement rule
+ * cannot express — blanking a mid-line `#` there would hide real arguments
+ * (`set p [file join # ../etc/passwd]`). No blanking fails toward
+ * detection. */
+const HASH_LINE_COMMENT_KINDS = new Set([
+  "sh", "bash", "zsh", "ksh", "csh", "tcsh", "fish", "bashrc", "zshrc",
+  "bash_profile", "profile", "py", "pyw", "pyi", "rb", "rake", "gemspec",
+  "raku", "pl", "pm", "r", "jl", "ps1", "psm1", "psd1", "yaml", "yml",
+  "toml", "ini", "cfg", "conf", "cnf", "env", "properties", "cmake", "mk",
+  "make", "makefile", "graphql", "gql", "nim", "nims", "cr",
+  "coffee", "hcl", "tf", "tfvars", "nix", "ex", "exs", "gitignore",
+  "gitattributes", "gitmodules", "gitconfig", "editorconfig", "crontab",
+]);
+
+/** `//` line comments: the C family and languages that borrowed it. Markup
+ * formats (HTML, component templates) and mixed-grammar files (jsx/tsx —
+ * JSX text between elements — and PHP, which interleaves HTML text between
+ * `?>` and `<?php`) are deliberately absent: a `//` there can be literal
+ * text, and blanking it would hide real code that follows on the line. If
+ * the lightweight lexer cannot prove something is a comment, it is scanned
+ * as code; embedded script comments simply fire instead. */
+const SLASH_LINE_COMMENT_KINDS = new Set([
+  "js", "mjs", "cjs", "ts", "cts", "mts", "c", "h", "cc", "cpp",
+  "cxx", "hpp", "hh", "cs", "java", "go", "rs", "swift", "kt", "kts", "scala",
+  "sc", "dart", "zig", "jsonc", "json5", "sass", "scss",
+  "less", "proto", "fbs", "thrift", "groovy", "gradle", "ino", "glsl", "vert",
+  "frag", "comp", "hlsl", "hcl", "tf", "tfvars",
+]);
+
+/** `--` line comments: SQL, Lua, Haskell, Ada, Elm. */
+const DASH_LINE_COMMENT_KINDS = new Set([
+  "sql", "lua", "hs", "lhs", "ada", "adb", "ads", "elm", "vhdl", "vhd",
+]);
+
+/** `/* ... *​/` block comments: the C family, CSS, SQL, and schema/HCL
+ * languages. Markup and mixed-grammar formats are absent for the same
+ * reason as above. */
+const BLOCK_COMMENT_KINDS = new Set([
+  "js", "mjs", "cjs", "ts", "cts", "mts", "c", "h", "cc", "cpp",
+  "cxx", "hpp", "hh", "cs", "java", "go", "rs", "swift", "kt", "kts", "scala",
+  "sc", "dart", "css", "scss", "sass", "less", "sql",
+  "jsonc", "json5", "proto", "fbs", "thrift", "groovy", "gradle", "ino",
+  "glsl", "vert", "frag", "comp", "hlsl", "hcl", "tf", "tfvars", "nix",
+]);
+
+/** Which comment markers the file's language actually has. A null path (a
+ * headerless or synthetic chunk) yields none: with no language there is no
+ * basis for treating any marker as a comment, and scanning everything as code
+ * is the conservative direction. */
+function commentMarkersFor(path: string | null): {
+  hash: boolean;
+  slash: boolean;
+  dash: boolean;
+  block: boolean;
+} {
+  if (path === null) {
+    return { hash: false, slash: false, dash: false, block: false };
+  }
+  const kind = fileKindToken(path);
+  return {
+    hash: HASH_LINE_COMMENT_KINDS.has(kind),
+    slash: SLASH_LINE_COMMENT_KINDS.has(kind),
+    dash: DASH_LINE_COMMENT_KINDS.has(kind),
+    block: BLOCK_COMMENT_KINDS.has(kind),
+  };
+}
+/** The closing marker for a block opened at column `startCol` of the stream
+ * line at `startK`, or null when none appears within `MAX_BLOCK_CARRY_LINES`
+ * lines. The search is quote-agnostic: the first closing marker wins, because
+ * quotes have no syntax inside a block comment — a quoted one is still text
+ * that closes it (the C/JS/CSS rule). */
+function findBlockClose(
+  lines: readonly string[],
+  indices: readonly number[],
+  startK: number,
+  startCol: number,
+): { k: number; col: number } | null {
+  for (let k = startK; k < indices.length && k <= startK + MAX_BLOCK_CARRY_LINES; k++) {
+    const text = lines[indices[k] ?? 0] ?? "";
+    const col = text.indexOf("*/", k === startK ? startCol : 0);
+    if (col !== -1) return { k, col };
+  }
+  return null;
+}
+
+/** Blank one diff stream's lines — the line indices belonging to one side of
+ * the diff. A cross-line block comment is blanked only once its closing marker
+ * is actually found within the stream, so an opener that never closes (a
+ * phantom such as a shell glob or a regex literal) is left as code and can
+ * never hide the real traversal that follows it. Returns the replacement text
+ * for the lines it touched. */
+function blankStream(
+  lines: readonly string[],
+  indices: readonly number[],
+  markers: { hash: boolean; slash: boolean; dash: boolean; block: boolean },
+): Map<number, string> {
+  const chars = new Map<number, string[]>();
+  const charsFor = (index: number): string[] => {
+    let arr = chars.get(index);
+    if (arr === undefined) {
+      arr = (lines[index] ?? "").split("");
+      chars.set(index, arr);
+    }
+    return arr;
+  };
+  let k = 0;
+  let col = 0;
+  while (k < indices.length) {
+    const index = indices[k] ?? 0;
+    const line = lines[index] ?? "";
+    const arr = charsFor(index);
+    const n = arr.length;
+    const prefix = DIFF_MARKERS.has(diffMarker(line)) ? 1 : 0;
+    let i = col;
+    let jumped = false;
+    let quote: string | null = null;
+    while (i < n) {
+      const ch = arr[i] ?? "";
+      if (quote !== null) {
+        if (ch === "\\" && i + 1 < n) {
+          i += 2;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        i += 1;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") {
+        quote = ch;
+        i += 1;
+        continue;
+      }
+      if (markers.block && ch === "/" && arr[i + 1] === "*") {
+        // Quote-agnostic: the first closing marker wins. Quotes have no
+        // syntax inside a block comment, so skipping a quoted one to keep
+        // scanning would pair quotes across the executable code that follows
+        // and blank it — a false negative.
+        const close = line.indexOf("*/", i + 2);
+        if (close === -1) {
+          if (isBlockOpener(arr, i)) {
+            const end = findBlockClose(lines, indices, k, i + 2);
+            if (end !== null) {
+              for (let c = i; c < n; c++) arr[c] = " ";
+              for (let m = k + 1; m < end.k; m++) {
+                const mid = charsFor(indices[m] ?? 0);
+                for (let c = 0; c < mid.length; c++) mid[c] = " ";
+              }
+              const closer = charsFor(indices[end.k] ?? 0);
+              for (let c = 0; c <= end.col + 1 && c < closer.length; c++) closer[c] = " ";
+              k = end.k;
+              col = end.col + 2;
+              jumped = true;
+              break;
+            }
+          }
+          i += 1;
+          continue;
+        }
+        for (let c = i; c <= close + 1 && c < n; c++) arr[c] = " ";
+        i = close + 2;
+        continue;
+      }
+      if (
+        markers.slash &&
+        ch === "/" &&
+        arr[i + 1] === "/" &&
+        commentMarkerAt(arr, i, prefix, 2, false)
+      ) {
+        for (let c = i; c < n; c++) arr[c] = " ";
+        break;
+      }
+      if (markers.hash && ch === "#" && commentMarkerAt(arr, i, prefix, 1, true)) {
+        for (let c = i; c < n; c++) arr[c] = " ";
+        break;
+      }
+      if (
+        markers.dash &&
+        ch === "-" &&
+        arr[i + 1] === "-" &&
+        commentMarkerAt(arr, i, prefix, 2, true)
+      ) {
+        for (let c = i; c < n; c++) arr[c] = " ";
+        break;
+      }
+      i += 1;
+    }
+    if (!jumped) {
+      k += 1;
+      col = 0;
+    }
+  }
+  return new Map([...chars].map(([index, arr]) => [index, arr.join("")]));
+}
+
+/** Blank every comment span in a diff chunk's lines, replacing it with spaces
+ * so line structure and character offsets are preserved. Language-aware: only
+ * markers that are comments in the chunk file's language are blanked
+ * (`commentMarkersFor`) — a `/*` in a shell file is a glob, not a comment, and
+ * blanking it would hide the real code that follows. Quote-aware (a `#`,
+ * `//`, or `--` inside a string literal is data, not a marker) and
+ * block-aware, so a JSDoc continuation line — which carries no marker of its
+ * own — is blanked along with the `/**` that opened it.
+ *
+ * Every rule here fails toward detection, because a false negative (a real
+ * traversal hidden) is worse than a false positive (a prose mention fired):
+ *   - a unified diff's `-` lines are the old file and its `+`/context lines are
+ *     the new one, and each stream is blanked independently, so a removed
+ *     line's `/*` can never blank an added line's code;
+ *   - a line-comment marker must be a standalone token or follow a statement
+ *     terminator (`commentMarkerAt`), so a CSS hex colour, a URL scheme, an
+ *     escaped regex slash, and an unspaced floor division stay code;
+ *   - a cross-line block is blanked only when its closer is found
+ *     (`findBlockClose`), so a phantom opener cannot blank what follows, and
+ *     the closer search takes the FIRST closing marker — quotes have no
+ *     syntax inside a comment, so a quoted one still closes it;
+ *   - a cross-line opener must look like a comment, not a glob (`build/*`,
+ *     `src/*.py`, `rm -rf /*` — see `isBlockOpener`), because with a
+ *     quote-agnostic closer a glob could pair with a later closing marker and
+ *     blank the code in between;
+ *   - only markers that are comments in the chunk file's language are blanked
+ *     (`commentMarkersFor`); unknown types blank nothing, and languages whose
+ *     marker placement is stricter than the shared rule (Tcl, Dockerfile `#`)
+ *     blank nothing rather than guess;
+ *   - commentFree is the SOLE comment authority: every downstream scan
+ *     (lexical classes, fs evidence, operand extraction) consumes these
+ *     comment-free lines and never re-interprets markers itself;
+ *   - quote state is per-line, so a marker inside a string that spans lines —
+ *     a heredoc body, a triple-quoted docstring — is still treated as a
+ *     comment and blanks the rest of its line: a known, accepted limitation;
+ *   - an unterminated quote is left as-is, so the rest of the line is still
+ *     scanned rather than being swallowed as a comment. */
+function blankCommentSpans(lines: string[], path: string | null): string[] {
+  const markers = commentMarkersFor(path);
+  const out = lines.slice();
+  const streams = new Map<string, number[]>();
+  lines.forEach((line, index) => {
+    const marker = diffMarker(line);
+    const key = marker === "-" ? "-" : marker === "\u0000" ? "\u0000" : "+";
+    const bucket = streams.get(key);
+    if (bucket === undefined) streams.set(key, [index]);
+    else bucket.push(index);
+  });
+  for (const indices of streams.values()) {
+    for (const [index, text] of blankStream(lines, indices, markers)) out[index] = text;
+  }
+  return out;
+}
+
+function neutralizeChunkLines(commentFree: string[]): string[] {
   /** Neutralize a diff chunk line by line, feeding each line its adjacent
-   * RAW neighbors for the one-hop untrusted-flow refusal. */
-  return lines.map((line, index) =>
+   * comment-free neighbors for the one-hop untrusted-flow refusal. */
+  return commentFree.map((line, index) =>
     neutralizePathFalsePositives(
       line,
-      index > 0 ? lines[index - 1] ?? "" : "",
-      index + 1 < lines.length ? lines[index + 1] ?? "" : "",
+      index > 0 ? commentFree[index - 1] ?? "" : "",
+      index + 1 < commentFree.length ? commentFree[index + 1] ?? "" : "",
     ),
   );
 }
@@ -420,8 +749,10 @@ function neutralizeChunkLines(lines: string[]): string[] {
  * paths`, `Use sanitize_path before opening files.`) without constructing
  * any path, so these classes are skipped for documentation-only files and
  * scanned over comment-stripped code text. Deliberately NOT a phrase
- * blacklist: the distinction is executable-vs-prose context. All other
- * classes keep their existing semantics. */
+ * blacklist: the distinction is executable-vs-prose context. The remaining
+ * content classes scan the same comment-free text (see blankCommentSpans), so
+ * a mention that survives only inside a comment is discounted for every
+ * class, not just these two — `diff_comment` in the provenance records it. */
 const LEXICAL_CODE_ONLY_CLASSES = new Set<string>([
   "path_containment_or_sanitization",
   "path_reference_identifier",
@@ -632,28 +963,13 @@ function pathSample(line: string): string {
   return cleaned.trim().slice(0, MAX_PATH_SAMPLE_CHARS);
 }
 
-/** Truncate a quote-stripped line at its first comment marker (`#` or `//`).
- * String literals are already stripped, so a residual marker is a real
- * comment; interpolation-shaped literals may retain one (conservative
- * truncation of contrived content only). */
-function stripLineComment(line: string): string {
-  let cut = line.length;
-  for (const marker of ["#", "//"]) {
-    const pos = line.indexOf(marker);
-    if (pos !== -1 && pos < cut) cut = pos;
-  }
-  return line.slice(0, cut);
-}
-
-/** Line reduced to its executable-code text for the LEXICAL code-only
- * material classes: quoted spans are blanked whole (escape-aware — a `#` or
- * `//` inside a string literal is data, not a comment marker, and string
- * contents — including interpolation-shaped literals — are data, not code
- * identifiers), and the line is truncated at the first comment marker (`#`
- * or `//`) outside quotes. The distinction these classes need is
- * executable-vs-prose context: `function sanitizePath(p)` is code,
- * `// sanitize_path helper` and `log.info("sanitize_path ran")` are prose. */
-function stripCodeComments(line: string): string {
+/** Lexical view of a line for the code-only material classes: every quoted
+ * span is removed (quote chars doubled, contents dropped — string contents,
+ * interpolation included, are data, not code identifiers). Comments are NOT
+ * handled here: the comment-free lines from `blankCommentSpans` are the sole
+ * comment authority, so this runs only on text that has already been through
+ * them. */
+function stripQuotedSpans(line: string): string {
   const out: string[] = [];
   let i = 0;
   const n = line.length;
@@ -674,7 +990,6 @@ function stripCodeComments(line: string): string {
       i = j < n ? j + 1 : n;
       continue;
     }
-    if (ch === "#" || (ch === "/" && i + 1 < n && line[i + 1] === "/")) break;
     out.push(ch);
     i += 1;
   }
@@ -729,13 +1044,14 @@ function pathlibDivisionTail(line: string, start = 0): number | null {
  * `index`: complete one-level-nested argument lists, and — for a call left
  * open across the line break — the balanced continuation lines up to and
  * including the closing paren. Only call arguments are included: trailing
- * comments (cut at the first `#`/`//`) and sibling statements after the
- * closer are excluded, and nested parentheses are tracked so an inner `)`
- * never ends the scan while outer operands remain. Static quoted literals
- * are stripped before extraction. Empty string when the line constructs no
- * path. */
+ * comments (already blanked in the comment-free lines this consumes —
+ * `blankCommentSpans` is the sole comment authority) and sibling statements
+ * after the closer are excluded, and nested parentheses are tracked so an
+ * inner `)` never ends the scan while outer operands remain. Static quoted
+ * literals are stripped before extraction. Empty string when the line
+ * constructs no path. */
 function constructionOperandSpans(lines: string[], index: number): string {
-  const line = stripLineComment(stripStaticStringLiterals(lines[index] ?? ""));
+  const line = stripStaticStringLiterals(lines[index] ?? "");
   const spans: string[] = [];
   for (const { pattern, isPathlib } of PATH_CONSTRUCTION_HEAD_PATTERNS) {
     for (const m of line.matchAll(pattern)) {
@@ -749,7 +1065,7 @@ function constructionOperandSpans(lines: string[], index: number): string {
         let depth = 1 + (piece.match(/\(/g) ?? []).length - (piece.match(/\)/g) ?? []).length;
         let accumulated = piece;
         for (let j = index + 1; j < Math.min(index + 1 + MAX_CONSTRUCTION_CONTINUATION_LINES, lines.length); j++) {
-          const continuation = stripLineComment(stripStaticStringLiterals(lines[j] ?? ""));
+          const continuation = stripStaticStringLiterals(lines[j] ?? "");
           const c = balancedClose(continuation, depth);
           if (c === null) {
             accumulated += `\n${continuation}`;
@@ -781,7 +1097,7 @@ function constructionOperandSpans(lines: string[], index: number): string {
  * files, and bounded line excerpts. */
 export interface PathHandlingSignal {
   signal: string;
-  source: "filename" | "diff" | "diff_test_file" | "filename_test_file";
+  source: "filename" | "diff" | "diff_test_file" | "filename_test_file" | "diff_comment";
   files: string[];
   samples: string[];
 }
@@ -813,7 +1129,9 @@ function recordSignal(
 }
 
 /** Bounded provenance for the path-handling signal model — why path handling
- * fired and which test-file signals were deliberately discounted. */
+ * fired, and which signals were deliberately discounted: test-file backing
+ * (`diff_test_file` / `filename_test_file`) and prose mentions that survive
+ * only inside a comment (`diff_comment`, #960). */
 export interface PathHandlingProvenance {
   fired: boolean;
   signals: PathHandlingSignal[];
@@ -858,7 +1176,13 @@ export function evaluatePathHandlingSignals(
     filenames.length > 0 && filenames.every((name) => isTestPath(name));
   for (const [chunkFile, lines] of splitDiffChunks(diffText)) {
     if (lines.length === 0) continue;
-    const neutralized = neutralizeChunkLines(lines);
+    // A headerless chunk has no language of its own; fall back to the single
+    // changed file when there is exactly one, and blank nothing otherwise.
+    const commentFree = blankCommentSpans(
+      lines,
+      chunkFile ?? (filenames.length === 1 ? filenames[0] ?? null : null),
+    );
+    const neutralized = neutralizeChunkLines(commentFree);
     const isTest =
       chunkFile !== null ? isTestPath(chunkFile) : allFilesAreTests;
     const buckets = isTest ? discountedBuckets : firedBuckets;
@@ -876,13 +1200,29 @@ export function evaluatePathHandlingSignals(
     for (const [className, patterns] of PATH_HANDLING_CONTENT_CLASSES) {
       const codeOnly = LEXICAL_CODE_ONLY_CLASSES.has(className);
       if (codeOnly && isDocumentation) continue;
+      let fired = false;
       for (let index = 0; index < neutralized.length; index++) {
-        const scanLine = codeOnly
-          ? stripCodeComments(neutralized[index] ?? "")
-          : (neutralized[index] ?? "");
-        if (!matchesAny(scanLine, patterns)) continue;
-        recordSignal(buckets, className, source, chunkFile, pathSample(lines[index] ?? ""));
-        break; // one bucket entry per class per chunk; samples merge across chunks
+        const raw = lines[index] ?? "";
+        // commentFree is the sole comment authority; the lexical view only
+        // additionally strips quoted spans.
+        const base = neutralized[index] ?? "";
+        const scanLine = codeOnly ? stripQuotedSpans(base) : base;
+        if (matchesAny(scanLine, patterns)) {
+          if (!fired) {
+            recordSignal(buckets, className, source, chunkFile, pathSample(raw));
+            fired = true;
+          }
+          continue;
+        }
+        // #960: a hit that survives in the raw line but is gone once comments
+        // are blanked is a prose mention, not a path surface. Record it as
+        // discounted (never fired) so the neutralization is explainable from
+        // the artifact alone, and so a future false positive is diagnosable
+        // without reading classifier internals.
+        if (matchesAny(commentFree[index] ?? "", patterns)) continue;
+        if (matchesAny(raw, patterns)) {
+          recordSignal(discountedBuckets, className, "diff_comment", chunkFile, pathSample(raw));
+        }
       }
     }
 
@@ -892,12 +1232,12 @@ export function evaluatePathHandlingSignals(
     // as likely to be a WHATWG URL component (`url.pathname`,
     // `location.pathname`) as a filesystem path variable (#854/#749).
     if (!isDocumentation) {
-      const fsEvidence = lines.some((line) =>
-        FS_API_EVIDENCE_PATTERN.test(stripCodeComments(stripStaticStringLiterals(line))),
+      const fsEvidence = lines.some((_line, index) =>
+        FS_API_EVIDENCE_PATTERN.test(stripQuotedSpans(commentFree[index] ?? "")),
       );
       if (fsEvidence) {
         for (let index = 0; index < neutralized.length; index++) {
-          const scanLine = stripCodeComments(neutralized[index] ?? "");
+          const scanLine = stripQuotedSpans(neutralized[index] ?? "");
           if (!PATHNAME_IDENTIFIER_PATTERN.test(scanLine)) continue;
           recordSignal(buckets, "path_reference_identifier", source, chunkFile, pathSample(lines[index] ?? ""));
           break;
@@ -913,7 +1253,7 @@ export function evaluatePathHandlingSignals(
     // inside the call's operands). Co-occurrence never fires.
     for (let index = 0; index < lines.length; index++) {
       const rawLine = lines[index] ?? "";
-      const flowText = constructionOperandSpans(lines, index);
+      const flowText = constructionOperandSpans(commentFree, index);
       if (!flowText) continue;
       if (matchesAny(flowText, UNTRUSTED_SOURCE_PATTERNS)) {
         recordSignal(buckets, "untrusted_source_join", source, chunkFile, pathSample(rawLine));
@@ -921,7 +1261,7 @@ export function evaluatePathHandlingSignals(
       }
       for (const adjIndex of [index - 1, index + 1]) {
         if (adjIndex < 0 || adjIndex >= lines.length) continue;
-        const target = untrustedAssignmentTarget(lines[adjIndex] ?? "");
+        const target = untrustedAssignmentTarget(commentFree[adjIndex] ?? "");
         if (target && mentionsIdentifier(flowText, target)) {
           recordSignal(buckets, "untrusted_source_join", source, chunkFile, pathSample(rawLine));
           break;
