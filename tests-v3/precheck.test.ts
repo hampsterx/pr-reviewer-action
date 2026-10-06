@@ -592,6 +592,8 @@ test("runPrecheck refuses Forgejo publish paths conservatively", async () => {
 // ---------------------------------------------------------------------------
 
 import { TangledNotImplementedError } from "../src/platform/tangled.js";
+import { GitHubAdapter } from "../src/platform/github.js";
+import type { FetchLike } from "../src/platform/http.js";
 import type { PlatformAdapter } from "../src/platform/types.js";
 import type { ExternalCheck } from "../src/platform/normalize.js";
 
@@ -841,6 +843,173 @@ function provenanceEnv(publishMode: string, platform: "github" | "forgejo" = "gi
   }
   return env;
 }
+
+test("#971: comment mode selects the newest body across managed-read pages", async () => {
+  const env = provenanceEnv("comment");
+  const current = provenanceFingerprint(env);
+  const stale = "stale-fingerprint|cfg:old-config";
+  const comments: ManagedComment[] = [
+    { id: 1, body: provenanceBody(stale, "issues"), created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-01T00:00:00Z", author: "pr-reviewer[bot]" },
+    { id: 101, body: provenanceBody(current, "clean"), created_at: "2024-01-02T00:00:00Z", updated_at: "2024-01-02T00:00:00Z", author: "pr-reviewer[bot]" },
+  ];
+  const output = await runPrecheck({ env, adapter: new FixtureAdapter("github", provenancePlatform({ identity: "pr-reviewer[bot]", comments })) });
+  assert.equal(output.should_review, "false");
+  assert.equal(output.skip_reason, "diff-unchanged");
+  assert.equal(output.verdict, "approve", "the newest body's clean verdict is carried forward");
+});
+
+test("#971: a stale page-one comment cannot authorize a skip over a newer fingerprint", async () => {
+  const env = provenanceEnv("comment");
+  const current = provenanceFingerprint(env);
+  const comments: ManagedComment[] = [
+    { id: 1, body: provenanceBody(current, "issues"), created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-01T00:00:00Z", author: "pr-reviewer[bot]" },
+    { id: 101, body: provenanceBody("newer-different-fingerprint|cfg:other", "clean"), created_at: "2024-01-02T00:00:00Z", updated_at: "2024-01-02T00:00:00Z", author: "pr-reviewer[bot]" },
+  ];
+  const output = await runPrecheck({ env, adapter: new FixtureAdapter("github", provenancePlatform({ identity: "pr-reviewer[bot]", comments })) });
+  assert.equal(output.should_review, "true");
+  assert.equal(output.verdict, undefined);
+});
+
+test("#971: review_verdict mode selects the newest body across managed-read pages", async () => {
+  const env = provenanceEnv("review_verdict");
+  const current = provenanceFingerprint(env);
+  const reviews: ManagedReview[] = [
+    { body: provenanceBody("stale-fingerprint|cfg:old-config", "issues"), submitted_at: "2024-01-01T00:00:00Z", author: "pr-reviewer[bot]" },
+    { body: provenanceBody(current, "clean"), submitted_at: "2024-01-02T00:00:00Z", author: "pr-reviewer[bot]" },
+  ];
+  const output = await runPrecheck({ env, adapter: new FixtureAdapter("github", provenancePlatform({ identity: "pr-reviewer[bot]", reviews })) });
+  assert.equal(output.should_review, "false");
+  assert.equal(output.skip_reason, "diff-unchanged");
+  assert.equal(output.verdict, "approve", "the newest review's clean verdict is carried forward");
+});
+
+test("#971: a stale page-one review cannot authorize a skip over a newer fingerprint", async () => {
+  const env = provenanceEnv("review_verdict");
+  const current = provenanceFingerprint(env);
+  const reviews: ManagedReview[] = [
+    { body: provenanceBody(current, "issues"), submitted_at: "2024-01-01T00:00:00Z", author: "pr-reviewer[bot]" },
+    { body: provenanceBody("newer-different-fingerprint|cfg:other", "clean"), submitted_at: "2024-01-02T00:00:00Z", author: "pr-reviewer[bot]" },
+  ];
+  const output = await runPrecheck({ env, adapter: new FixtureAdapter("github", provenancePlatform({ identity: "pr-reviewer[bot]", reviews })) });
+  assert.equal(output.should_review, "true");
+  assert.equal(output.verdict, undefined);
+});
+
+test("#971/#970: newer forged bodies across pages cannot override genuine provenance", async () => {
+  const env = provenanceEnv("comment");
+  const current = provenanceFingerprint(env);
+  const genuineAndForgery: ManagedComment[] = [
+    { id: 1, body: provenanceBody(current, "issues"), created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-01T00:00:00Z", author: "pr-reviewer[bot]" },
+    { id: 101, body: provenanceBody(current, "clean"), created_at: "2024-01-02T00:00:00Z", updated_at: "2024-01-02T00:00:00Z", author: "attacker" },
+  ];
+  const output = await runPrecheck({ env, adapter: new FixtureAdapter("github", provenancePlatform({ identity: "pr-reviewer[bot]", comments: genuineAndForgery })) });
+  assert.equal(output.should_review, "false");
+  assert.equal(output.verdict, "request_changes", "the authenticated page-one verdict remains authoritative");
+
+  const forgedAcrossPages: ManagedComment[] = [
+    { id: 101, body: provenanceBody(current, "clean"), created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-01T00:00:00Z", author: "attacker" },
+    { id: 102, body: provenanceBody(current, "clean"), created_at: "2024-01-02T00:00:00Z", updated_at: "2024-01-02T00:00:00Z", author: "attacker" },
+  ];
+  const forgedOutput = await runPrecheck({ env, adapter: new FixtureAdapter("github", provenancePlatform({ identity: "pr-reviewer[bot]", comments: forgedAcrossPages })) });
+  assert.equal(forgedOutput.should_review, "true");
+  assert.equal(forgedOutput.verdict, undefined);
+});
+
+test("#971 integration: runPrecheck sees the newest GitHub comment page", async () => {
+  const env = provenanceEnv("comment");
+  const current = provenanceFingerprint(env);
+  const different = "newest-different-fingerprint|cfg:other";
+  const seen: string[] = [];
+  const fetchImpl: FetchLike = async (input, init) => {
+    const url = new URL(String(input));
+    seen.push(url.toString());
+    if (url.pathname === "/graphql") return new Response(JSON.stringify({ data: { viewer: { login: "pr-reviewer[bot]" } } }), { status: 200 });
+    if (url.pathname === "/repos/misospace/demo/pulls/42" && new Headers(init?.headers).get("accept") === "application/vnd.github.v3.diff") {
+      return new Response(DIFF, { status: 200 });
+    }
+    if (url.pathname === "/repos/misospace/demo/pulls/42") {
+      return new Response(JSON.stringify({
+        number: 42,
+        state: "open",
+        draft: false,
+        head: { sha: "head-abc", ref: "f", repo: { full_name: "misospace/demo" } },
+        base: { sha: "base-abc", ref: "main", repo: { full_name: "misospace/demo" } },
+      }), { status: 200 });
+    }
+    if (url.pathname === "/repos/misospace/demo/issues/42/comments") {
+      if (url.searchParams.get("page") === "2") {
+        return new Response(JSON.stringify([{
+          id: 101,
+          body: provenanceBody(different, "clean"),
+          created_at: "2024-01-02T00:00:00Z",
+          updated_at: "2024-01-02T00:00:00Z",
+          user: { login: "pr-reviewer[bot]" },
+        }]), { status: 200 });
+      }
+      const pageOne = Array.from({ length: 100 }, (_, index) => ({
+        id: index + 1,
+        body: index === 0 ? provenanceBody(current, "issues") : `ordinary comment ${index}`,
+        created_at: "2024-01-01T00:00:00Z",
+        updated_at: "2024-01-01T00:00:00Z",
+        user: { login: "pr-reviewer[bot]" },
+      }));
+      return new Response(JSON.stringify(pageOne), {
+        status: 200,
+        headers: { Link: '<https://api.github.com/repos/misospace/demo/issues/42/comments?per_page=100&page=2>; rel="next"' },
+      });
+    }
+    if (url.pathname === "/repos/misospace/demo/pulls/42/reviews") return new Response("[]", { status: 200 });
+    throw new Error(`unexpected integration request: ${url.toString()}`);
+  };
+  const adapter = new GitHubAdapter({ repo: "misospace/demo", prNumber: "42", token: "Bearer test-token", fetchImpl });
+  const output = await runPrecheck({ env, adapter });
+  assert.equal(output.should_review, "true");
+  assert.ok(seen.includes("https://api.github.com/repos/misospace/demo/issues/42/comments?per_page=100&page=2"), "the real adapter must fetch page two");
+});
+
+test("#971 integration: a failed GitHub comment page cannot authorize a stale skip", async () => {
+  const env = provenanceEnv("comment");
+  const current = provenanceFingerprint(env);
+  const seen: string[] = [];
+  const fetchImpl: FetchLike = async (input, init) => {
+    const url = new URL(String(input));
+    seen.push(url.toString());
+    if (url.pathname === "/graphql") return new Response(JSON.stringify({ data: { viewer: { login: "pr-reviewer[bot]" } } }), { status: 200 });
+    if (url.pathname === "/repos/misospace/demo/pulls/42" && new Headers(init?.headers).get("accept") === "application/vnd.github.v3.diff") {
+      return new Response(DIFF, { status: 200 });
+    }
+    if (url.pathname === "/repos/misospace/demo/pulls/42") {
+      return new Response(JSON.stringify({
+        number: 42,
+        state: "open",
+        draft: false,
+        head: { sha: "head-abc", ref: "f", repo: { full_name: "misospace/demo" } },
+        base: { sha: "base-abc", ref: "main", repo: { full_name: "misospace/demo" } },
+      }), { status: 200 });
+    }
+    if (url.pathname === "/repos/misospace/demo/issues/42/comments") {
+      if (url.searchParams.get("page") === "2") return new Response("server error", { status: 500 });
+      const pageOne = Array.from({ length: 100 }, (_, index) => ({
+        id: index + 1,
+        body: index === 0 ? provenanceBody(current, "issues") : `ordinary comment ${index}`,
+        created_at: "2024-01-01T00:00:00Z",
+        updated_at: "2024-01-01T00:00:00Z",
+        user: { login: "pr-reviewer[bot]" },
+      }));
+      return new Response(JSON.stringify(pageOne), {
+        status: 200,
+        headers: { Link: '<https://api.github.com/repos/misospace/demo/issues/42/comments?per_page=100&page=2>; rel="next"' },
+      });
+    }
+    if (url.pathname === "/repos/misospace/demo/pulls/42/reviews") return new Response("[]", { status: 200 });
+    throw new Error(`unexpected integration request: ${url.toString()}`);
+  };
+  const adapter = new GitHubAdapter({ repo: "misospace/demo", prNumber: "42", token: "Bearer test-token", fetchImpl });
+  const output = await runPrecheck({ env, adapter });
+  assert.equal(output.should_review, "true");
+  assert.equal(output.verdict, undefined);
+  assert.ok(seen.includes("https://api.github.com/repos/misospace/demo/issues/42/comments?per_page=100&page=2"), "the real adapter must fetch page two");
+});
 
 test("#970: a newer forged marker/fingerprint/clean clone cannot override the genuine carried verdict", async () => {
   const env = provenanceEnv("comment");

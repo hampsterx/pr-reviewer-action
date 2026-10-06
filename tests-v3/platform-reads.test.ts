@@ -191,6 +191,125 @@ test("github pagination never follows a Link to another origin with the credenti
   assert.deepEqual(seen.map((s) => s.url), ["https://api.github.com/repos/o/r/pulls/7/reviews?per_page=100"]);
 });
 
+test("#971: GitHub managed comments follow Link rel=next and merge all bodies in order", async () => {
+  const pageOne = Array.from({ length: 100 }, (_, index) => ({
+    id: index + 1,
+    body: index === 0 ? "OLD managed body" : `comment ${index}`,
+    user: { login: "pr-reviewer[bot]" },
+  }));
+  const { fetchImpl, seen } = recorder((url) => {
+    if (url.searchParams.get("page") === "2") return json([{ id: 101, body: "NEWEST managed body", user: { login: "pr-reviewer[bot]" } }]);
+    return json(pageOne, 200, { Link: '<https://api.github.com/repos/o/r/issues/7/comments?per_page=100&page=2>; rel="next"' });
+  });
+  const adapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", fetchImpl });
+  const comments = await adapter.listIssueComments();
+  assert.equal(comments.length, 101);
+  assert.deepEqual(comments.filter((comment) => comment.body.includes("managed body")).map((comment) => comment.body), [
+    "OLD managed body",
+    "NEWEST managed body",
+  ]);
+  assert.equal(seen[1]?.url, "https://api.github.com/repos/o/r/issues/7/comments?per_page=100&page=2");
+});
+
+test("#971: GitHub managed reviews follow Link rel=next and merge all bodies in order", async () => {
+  const pageOne = Array.from({ length: 100 }, (_, index) => ({
+    id: index + 1,
+    body: index === 0 ? "OLD managed body" : `review ${index}`,
+    user: { login: "pr-reviewer[bot]" },
+  }));
+  const { fetchImpl, seen } = recorder((url) => {
+    if (url.searchParams.get("page") === "2") return json([{ id: 101, body: "NEWEST managed body", user: { login: "pr-reviewer[bot]" } }]);
+    return json(pageOne, 200, { Link: '<https://api.github.com/repos/o/r/pulls/7/reviews?per_page=100&page=2>; rel="next"' });
+  });
+  const adapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", fetchImpl });
+  const reviews = await adapter.listPrReviews();
+  assert.equal(reviews.length, 101);
+  assert.deepEqual(reviews.filter((review) => review.body.includes("managed body")).map((review) => review.body), [
+    "OLD managed body",
+    "NEWEST managed body",
+  ]);
+  assert.equal(seen[1]?.url, "https://api.github.com/repos/o/r/pulls/7/reviews?per_page=100&page=2");
+});
+
+test("#971: GitHub managed reads preserve the single-page response when there is no next Link", async () => {
+  const { fetchImpl, seen } = recorder((url) => url.pathname.endsWith("/comments")
+    ? json([{ id: 1, body: "comment body", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-02T00:00:00Z", user: { login: "commenter" } }])
+    : json([{ id: 2, body: "review body", submitted_at: "2026-01-03T00:00:00Z", user: { login: "reviewer" } }]));
+  const adapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", fetchImpl });
+  assert.deepEqual(await adapter.listIssueComments(), [
+    { body: "comment body", author: "commenter", id: 1, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-02T00:00:00Z" },
+  ]);
+  assert.deepEqual(await adapter.listPrReviews(), [
+    { body: "review body", author: "reviewer", submitted_at: "2026-01-03T00:00:00Z" },
+  ]);
+  assert.equal(seen.length, 2);
+});
+
+test("#971: GitHub managed reads fail closed on failed later pages", async () => {
+  const pageOne = Array.from({ length: 100 }, (_, index) => ({
+    id: index + 1,
+    body: index === 0 ? "OLD managed body" : `entry ${index}`,
+    user: { login: "pr-reviewer[bot]" },
+  }));
+  const failedPage = (url: URL, path: string): boolean => url.pathname.endsWith(path) && url.searchParams.get("page") === "2";
+  const comments = recorder((url) => failedPage(url, "/comments")
+    ? json({ message: "server error" }, 500)
+    : json(pageOne, 200, { Link: '<https://api.github.com/repos/o/r/issues/7/comments?per_page=100&page=2>; rel="next"' }));
+  const commentAdapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", fetchImpl: comments.fetchImpl });
+  assert.deepEqual(await commentAdapter.listIssueComments(), []);
+  assert.equal(comments.seen.length, 2);
+
+  const reviews = recorder((url) => failedPage(url, "/reviews")
+    ? json({ message: "server error" }, 500)
+    : json(pageOne, 200, { Link: '<https://api.github.com/repos/o/r/pulls/7/reviews?per_page=100&page=2>; rel="next"' }));
+  const reviewAdapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", fetchImpl: reviews.fetchImpl });
+  assert.deepEqual(await reviewAdapter.listPrReviews(), []);
+  assert.equal(reviews.seen.length, 2);
+
+  const transport = recorder((url) => {
+    if (url.searchParams.get("page") === "2") throw new Error("page two unavailable");
+    return json(pageOne, 200, { Link: '<https://api.github.com/repos/o/r/issues/7/comments?per_page=100&page=2>; rel="next"' });
+  });
+  assert.deepEqual(await new GitHubAdapter({ repo: "o/r", prNumber: "7", fetchImpl: transport.fetchImpl }).listIssueComments(), []);
+  assert.equal(transport.seen.length, 2);
+});
+
+test("#971: GitHub managed reads stop at MAX_PAGES and fail closed", async () => {
+  const alwaysNext = (url: URL): Response => {
+    const page = Number(url.searchParams.get("page") ?? "1");
+    const next = page + 1;
+    return json([], 200, { Link: `<https://api.github.com/repos/o/r/${url.pathname.endsWith("/comments") ? `issues/7/comments` : `pulls/7/reviews`}?per_page=100&page=${next}>; rel="next"` });
+  };
+  const comments = recorder((url) => alwaysNext(url));
+  const commentAdapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", fetchImpl: comments.fetchImpl });
+  assert.deepEqual(await commentAdapter.listIssueComments(), []);
+  assert.equal(comments.seen.length, 100);
+
+  const reviews = recorder((url) => alwaysNext(url));
+  const reviewAdapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", fetchImpl: reviews.fetchImpl });
+  assert.deepEqual(await reviewAdapter.listPrReviews(), []);
+  assert.equal(reviews.seen.length, 100);
+});
+
+test("#971: GitHub managed reads refuse an off-origin next Link before sending credentials", async () => {
+  const hostile = (): Response => json([{ id: 1, body: "managed body", user: { login: "pr-reviewer[bot]" } }], 200, {
+    Link: '<https://evil.example/steal?page=2>; rel="next"',
+  });
+  const comments = recorder(() => hostile());
+  const commentAdapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", token: "Bearer secret", fetchImpl: comments.fetchImpl });
+  assert.deepEqual(await commentAdapter.listIssueComments(), []);
+  assert.equal(comments.seen.length, 1);
+  assert.equal(comments.seen[0]?.auth, "Bearer secret");
+  assert.equal(new URL(comments.seen[0]!.url).origin, "https://api.github.com");
+
+  const reviews = recorder(() => hostile());
+  const reviewAdapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", token: "Bearer secret", fetchImpl: reviews.fetchImpl });
+  assert.deepEqual(await reviewAdapter.listPrReviews(), []);
+  assert.equal(reviews.seen.length, 1);
+  assert.equal(reviews.seen[0]?.auth, "Bearer secret");
+  assert.equal(new URL(reviews.seen[0]!.url).origin, "https://api.github.com");
+});
+
 test("nextLink parses RFC 8288 rel=next among several relations", () => {
   assert.equal(nextLink('<https://a/x?page=2>; rel="next", <https://a/x?page=5>; rel="last"'), "https://a/x?page=2");
   assert.equal(nextLink('<https://a/x?page=5>; rel="last"'), null);
