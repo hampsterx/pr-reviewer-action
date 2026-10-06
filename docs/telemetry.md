@@ -23,7 +23,7 @@ Every key below is the literal JSON key in the marker.
 | `base_sha` | string | PR base SHA at review time. |
 | `review_result` | string | `clean`, `findings`, `partial`, or `issues` — derived from the same still-open findings and coverage the published review shows. `partial` means the review's own coverage is incomplete (required checks, the tool-loop investigation, or an unverifiable requirement trace — see `incomplete_reason` for which); `verdict: approve` with this is **not** an approval — gate merges on both, never on the verdict alone. |
 | `required_checks` | string, omitted | `complete` or `incomplete` — present only when required-check validation ran (omitted for `none`). |
-| `review_route` | string, omitted | Model route used: `primary`, `smart`, or `escalated` (omitted for `legacy`). |
+| `review_route` | string, omitted | Model route used: `primary` or `escalated` (`smart` is a legacy value from pre-#965 markers; omitted for `legacy`). |
 | `escalation_reason` | string array, omitted | Why an escalated route was taken (e.g. `primary_requested`). Omitted when empty. |
 | `cache_hit_ratio` | number, omitted | Prompt-cache hit ratio for this review, `0.0`–`1.0`. As of v3.1.0 this is **cache reads divided by total prompt tokens** for the run (cached prompt tokens over total prompt tokens, rounded to 3 decimals; `0.0` when there were no prompt tokens to divide by). Omitted when unavailable. |
 | `coverage` | string, omitted | `"partial"` when the #810 tool-loop investigation stopped on a budget with changed files or specialist leads it never read/resolved. Omitted for complete coverage. |

@@ -213,7 +213,6 @@ Set any of them explicitly to keep the v2 behavior; the `config-default-resoluti
 | `ai_smart_base_url` | `ai-smart-base-url` |
 | `ai_smart_api_format` | `ai-smart-api-format` |
 | `ai_smart_api_key` | `ai-smart-api-key` |
-| `escalate_on_risk_flags` | `escalate-on-risk-flags` |
 | `ai_stream` | `ai-stream` |
 | `ai_fallback_stream` | `ai-fallback-stream` |
 | `allowed_source_hosts` | `allowed-source-hosts` |
@@ -493,16 +492,21 @@ These v2 fields have no v3 ID or compatibility alias:
 | `escalate_on_fast_low_confidence` | Input | Remove it. Deprecated since #721; no longer affects escalation. |
 | `escalate_on_tool_or_evidence_blockers` | Input | Remove it. Deprecated since #721; no longer affects escalation (deterministic evidence/tool enforcement is unaffected). |
 | `escalate_on_tool_planning_failure` | Input | Remove it. Deprecated since #721; no longer affects escalation. |
+| `escalate_on_risk_flags` | Input | Remove it. Removed in v3 by #965: deterministic direct-smart pre-routing contradicted the primary-first policy. `review-routing-mode: auto` now always starts on the primary model; the smart model is reached only via the reviewer-requested post-primary path (#721). `route_signals` remain available for specialist role selection, required checks, and telemetry. |
 
 The `tool_planning_*` inputs are currently deprecated fallback inputs in v2
 and are removed in v3. They are intentionally not copied into the v3 contract.
 
-The five `escalate_on_*` inputs above are also currently deprecated in v2
+The `escalate_on_*` inputs above are also currently deprecated in v2
 (accepted for backward compatibility since #721 but already inert — they no
 longer trigger escalation, which is reviewer-requested only via the
 structured `smart_review_requested` verdict field). #777's moderate input
 trim drops this dead weight from the v3 contract too; they are not copied
-forward under any name.
+forward under any name. #965 completes that arc: `escalate_on_risk_flags`
+— the one `escalate_on_*` input v3 still carried as a live pre-routing
+control — is removed as well, and `review-routing-mode: auto` means
+primary-first (the initial review always runs on the primary model; smart
+is reachable only through the reviewer-requested post-primary path).
 
 ## Repository config (#727, adopted for the Action by #777)
 

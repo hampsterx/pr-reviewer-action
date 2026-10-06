@@ -66,16 +66,15 @@ Primary/smart model split and escalation triggers.
 
 | Input | Default | Description |
 |-------|---------|-------------|
-| `review-routing-mode` | `off` | Route PR reviews between the primary and smart models based on the deterministic classification. 'off' (default) preserves existing primary/fallback behavior. 'auto' sends PRs whose pr_kind or risk_flags match escalate-on-risk-flags to the smart model (when one is configured) and keeps everything else on the primary model. |
+| `review-routing-mode` | `off` | Route PR reviews between the primary and smart models. 'off' (default) preserves legacy behavior: the AI_* model configuration is used as-is with no profile binding. 'auto' is the primary-first policy (#965): the initial review always runs on the primary model, deep-review specialists inherit the primary profile, and the smart model is reached only when the completed primary verdict explicitly sets smart_review_requested=true (#721), bounded to one rerun. Deterministic classification stays available for specialist role selection, required checks, and telemetry — never for model routing. |
 | `ai-primary-model` | empty | Model for the primary review route when review-routing-mode=auto. Defaults to ai-model. |
 | `ai-primary-base-url` | empty | Base URL for the primary route model. Defaults to ai-base-url. |
 | `ai-primary-api-format` | empty | API format for the primary route model (openai or anthropic). Defaults to ai-api-format. |
 | `ai-primary-api-key` | empty | API key for the primary route model. Defaults to ai-api-key. |
-| `ai-smart-model` | empty | Opt-in smarter model for high-risk reviews (review-routing-mode=auto). With no smart model set, auto-routing stays on the primary model and never escalates. After a successful primary review, a smart re-review runs only when the primary reviewer explicitly requests it via the structured smart_review_requested verdict field (#721); heuristic signals (request_changes, low confidence, blockers, incomplete coverage) are telemetry only. The fallback model is NEVER an escalation target — it only catches an availability failure of the first-pass model (primary, or smart on a direct smart route). |
+| `ai-smart-model` | empty | Opt-in smarter model for high-risk reviews (review-routing-mode=auto). With no smart model set, auto-routing stays on the primary model and never escalates. After a successful primary review, a smart re-review runs only when the primary reviewer explicitly requests it via the structured smart_review_requested verdict field (#721); heuristic signals (request_changes, low confidence, blockers, incomplete coverage) are telemetry only. The fallback model is NEVER an escalation target — it only catches an availability failure of the first-pass (primary) model. |
 | `ai-smart-base-url` | empty | Base URL for the smart model. Defaults to ai-base-url. |
 | `ai-smart-api-format` | empty | API format for the smart model (openai or anthropic). Defaults to ai-api-format. |
 | `ai-smart-api-key` | empty | API key for the smart model. Defaults to ai-api-key. |
-| `escalate-on-risk-flags` | `linked_security_issue,linked_priority_p0,linked_priority_p1,auth_changes,public_route_changes,file_serving_changes,path_handling_changes,secret_handling_changes,db_or_migration_changes` | Comma-separated pr_kind / risk_flag names that route directly to the smart model when review-routing-mode=auto. Matched against route_signals — linked-issue flags and file-based signals backed by an actual changed filename — so a benign PR whose diff merely mentions a pattern (e.g. os.path) does not route. |
 
 ### Publishing
 

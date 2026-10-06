@@ -181,9 +181,9 @@ function envIntIsSet(env: EnvLike, name: string): boolean {
 }
 
 /** The model profile whose loop limits a harness run uses. The tier names the
- * artifact slot, and the primary slot can carry a directly routed smart model
- * (REVIEW_CONTEXT_PROFILE=smart), so its window and loop limits follow the
- * profile, as toolBudgetRoute already does for the request budget. */
+ * artifact slot; a run on the smart profile (REVIEW_CONTEXT_PROFILE=smart —
+ * the escalation smart tier) follows that profile's window and loop limits,
+ * as toolBudgetRoute already does for the request budget. */
 export function loopLimitsProfile(env: EnvLike, tier: string): "primary" | "smart" {
   if (tier === "smart") return "smart";
   return (env.REVIEW_CONTEXT_PROFILE ?? "").trim().toLowerCase() === "smart" ? "smart" : "primary";
@@ -1599,7 +1599,8 @@ export async function runNativeLoop(input: RunNativeLoopInput): Promise<boolean>
             `  native_loop: verdict-corpus dedup dropped ${dropped} section(s) already in the planning context (${saved} bytes saved)`,
           );
         }
-        // The initial artifact slot can contain a directly routed smart model.
+        // #965: the initial pass is always the primary profile; the smart
+        // profile belongs to the escalation tier.
         const profile = input.tier === "smart" ? "smart" : (env.REVIEW_CONTEXT_PROFILE ?? "primary");
         const shape = (profile === "smart" ? env.SMART_REQUEST_SHAPE : env.PRIMARY_REQUEST_SHAPE) ?? "default";
         if (shape === "trailing_task") {

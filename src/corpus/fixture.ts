@@ -5,7 +5,7 @@
  *
  * The driver mirrors the source-time sequence of scripts/sections/corpus.sh:
  * standards-context preparation → tool-harness placeholder states → primary
- * (or direct-smart-profile) build → optional gates rebuild → tool-harness
+ * profile build → optional gates rebuild → tool-harness
  * fork gate / simulated harness outputs → post-harness rebuild → any extra
  * explicit build calls → the optional harness-findings section swap. The v2
  * side (tests/parity_runners/v2_corpus.sh) runs the real corpus.sh top-level
@@ -260,7 +260,7 @@ export function runCorpusFixture(fixturePath: string): { ok: boolean; values?: R
   const stopAfter = fixture.stop_after ?? "";
 
   try {
-    // Build #1: the corpus.sh source-time primary (or direct-smart-profile) build.
+    // Build #1: the corpus.sh source-time primary-profile build.
     values["status:initial"] = runPipelineBuild(profile, "primary") ? "0" : "1";
     state.set("review-corpus.truncated.md", new Uint8Array(state.get("review-corpus.md") ?? []));
 

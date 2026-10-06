@@ -4,6 +4,8 @@ import type { EnvLike } from "../tools/budget.js";
  * Review routing and tier bindings, ported from scripts/sections/classification.sh
  * and scripts/model_call.sh. Resolution is pure and uses injected environment
  * values; post-primary heuristic escalation remains telemetry only (#721).
+ * #965: the primary-first policy — `auto` always starts on the primary model
+ * and there is no deterministic pre-primary route to the smart model.
  */
 export type ReviewRoute = "legacy" | "primary" | "smart";
 export interface TierSettings {
@@ -32,31 +34,15 @@ function numberValue(env: EnvLike, key: string, fallback: number): number {
 }
 function trueValue(raw: string | undefined): boolean { return (raw ?? "").trim().toLowerCase() === "true"; }
 
-export function resolveReviewRoute(input: {
-  routingMode: string;
-  routeSignals: string[];
-  escalateOnRiskFlags: string[];
-  smartModelResolved: boolean;
-}): { route: ReviewRoute; reason: string } {
+/** #965: the primary-first policy. In `auto` mode the initial review always
+ * uses the primary profile; the smart model is reached only when the completed
+ * primary verdict explicitly sets `smart_review_requested: true` (#721), and
+ * fallback remains availability recovery, never escalation. Deterministic
+ * classification (`route_signals`) stays available for specialist role
+ * selection, required checks, and telemetry — never for model routing. */
+export function resolveReviewRoute(input: { routingMode: string }): { route: ReviewRoute; reason: string } {
   if (input.routingMode.trim().toLowerCase() !== "auto") return { route: "legacy", reason: "routing off" };
-  const candidates = `,${input.routeSignals.filter((x) => x !== "").join(",")},`;
-  let matched = "";
-  for (const raw of input.escalateOnRiskFlags) {
-    const flag = raw.trim();
-    if (!flag) continue;
-    if (candidates.includes(`,${flag},`)) { matched = flag; break; }
-  }
-  if (matched) return input.smartModelResolved
-    ? { route: "smart", reason: `risk match: ${matched}` }
-    : { route: "primary", reason: `risk match: ${matched}, but no smart model configured` };
-  return { route: "primary", reason: "no escalation flags matched" };
-}
-
-export function routeSignalsFromClassification(classification: Record<string, unknown>): string[] {
-  const raw = Object.hasOwn(classification, "route_signals")
-    ? (Array.isArray(classification.route_signals) ? classification.route_signals : [])
-    : [...(Array.isArray(classification.risk_flags) ? classification.risk_flags : []), classification.pr_kind ?? ""];
-  return raw.filter((signal) => signal !== "").map(String);
+  return { route: "primary", reason: "primary-first: the primary reviews first; smart is reviewer-requested only (#721)" };
 }
 
 export function resolveTierProfiles(env: EnvLike): TierProfiles {

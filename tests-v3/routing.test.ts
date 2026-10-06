@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { isLowConfidence, reviewerRequestedEscalation, shouldEscalate } from "../src/routing/escalation.js";
-import { resolveReviewRoute, resolveTierProfiles, routeSignalsFromClassification, tierRequestShape } from "../src/routing/tiers.js";
+import { resolveReviewRoute, resolveTierProfiles, tierRequestShape } from "../src/routing/tiers.js";
 
 const flags = { onIncomplete: true, onRequestChanges: true, onLowConfidence: true, onBlockers: true, onPlanningFailure: true };
 const longReview = "The change is reviewed carefully and the behavior appears correct. No concerns identified in the touched paths.";
@@ -51,20 +51,12 @@ CI test suite results and tool output are unavailable in this environment.`), fa
 Could not determine behavior.`), false, "Unknowns content at or below the 40-character floor is ignored");
 });
 
-test("resolveReviewRoute honors legacy, exact comma-delimited matching, and flag order", () => {
-  const resolve = (routingMode: string, routeSignals: string[], escalateOnRiskFlags: string[], smartModelResolved = true) => resolveReviewRoute({ routingMode, routeSignals, escalateOnRiskFlags, smartModelResolved });
-  assert.deepEqual(resolve("off", ["auth_changes"], ["auth_changes"]), { route: "legacy", reason: "routing off" });
-  assert.deepEqual(resolve("AUTO", ["ordinary"], ["auth_changes"]), { route: "primary", reason: "no escalation flags matched" });
-  assert.deepEqual(resolve("auto", ["auth_changes", "public_route_changes"], ["public_route_changes", "auth_changes"]), { route: "smart", reason: "risk match: public_route_changes" });
-  assert.deepEqual(resolve("auto", ["auth_changes"], ["auth_changes"], false), { route: "primary", reason: "risk match: auth_changes, but no smart model configured" });
-  assert.deepEqual(resolve("auto", ["auth_changes"], ["auth"]), { route: "primary", reason: "no escalation flags matched" }, "comma wrappers prevent substring matches");
-  assert.deepEqual(resolve("auto", ["auth"], ["auth_changes"]), { route: "primary", reason: "no escalation flags matched" });
-});
-
-test("route signal fallback mirrors classification's route_signals key-presence behavior", () => {
-  assert.deepEqual(routeSignalsFromClassification({ risk_flags: ["auth_changes", ""], pr_kind: "security" }), ["auth_changes", "security"]);
-  assert.deepEqual(routeSignalsFromClassification({ route_signals: [], risk_flags: ["auth_changes"], pr_kind: "security" }), []);
-  assert.deepEqual(routeSignalsFromClassification({ route_signals: ["", "security"] }), ["security"]);
+test("resolveReviewRoute always starts auto routing on the primary profile", () => {
+  assert.deepEqual(resolveReviewRoute({ routingMode: "off" }), { route: "legacy", reason: "routing off" });
+  const auto = { route: "primary", reason: "primary-first: the primary reviews first; smart is reviewer-requested only (#721)" };
+  for (const routingMode of ["auto", "AUTO", " auto "]) {
+    assert.deepEqual(resolveReviewRoute({ routingMode }), auto);
+  }
 });
 
 test("tier profiles bind model defaults, retry/stream settings, and request shapes", () => {

@@ -36,7 +36,7 @@ import {
 import { extractRequirementLedger, ledgerToArtifact, renderRequirementLedgerMarkdown } from "../requirements/ledger.js";
 import { requirementLedgerPresence } from "../requirements/presence.js";
 import { classifyPr, classificationToArtifact } from "../classification/classify.js";
-import { resolveReviewRoute, resolveTierProfiles, routeSignalsFromClassification, tierRequestShape, type TierProfiles } from "../routing/tiers.js";
+import { resolveReviewRoute, resolveTierProfiles, tierRequestShape, type TierProfiles } from "../routing/tiers.js";
 import { reviewerRequestedEscalation } from "../routing/escalation.js";
 import { buildSpecialistCorpus } from "../specialists/corpus.js";
 import { forkGate, type ForkedGate, type GateName, type GateOutcome } from "../gates/gates.js";
@@ -609,20 +609,13 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
   // up being.
   env.SUBSTANTIAL_CODE_CHANGE = classification.substantialCodeChange ? "true" : "false";
 
-  const { route, reason } = resolveReviewRoute({
-    routingMode: env.REVIEW_ROUTING_MODE ?? "off",
-    routeSignals: routeSignalsFromClassification(classificationArtifact),
-    escalateOnRiskFlags: splitCsv(env.ESCALATE_ON_RISK_FLAGS ?? ""),
-    smartModelResolved: profiles.smart.resolved,
-  });
+  const { route, reason } = resolveReviewRoute({ routingMode: env.REVIEW_ROUTING_MODE ?? "off" });
   env.REVIEW_ROUTE = route;
   env.ROUTE_REASON = reason;
   if (route === "primary") {
     Object.assign(env, { AI_BASE_URL: profiles.primary.baseUrl, AI_MODEL: profiles.primary.model, AI_API_FORMAT: profiles.primary.apiFormat, AI_API_KEY: profiles.primary.apiKey });
-  } else if (route === "smart") {
-    Object.assign(env, { AI_BASE_URL: profiles.smart.baseUrl, AI_MODEL: profiles.smart.model, AI_API_FORMAT: profiles.smart.apiFormat, AI_API_KEY: profiles.smart.apiKey });
   }
-  env.REVIEW_CONTEXT_PROFILE = route === "smart" ? "smart" : "primary";
+  env.REVIEW_CONTEXT_PROFILE = "primary";
   log(`Review route: ${route} (${reason}) → ${env.AI_MODEL}`);
 
   promptState = applySystemPromptFragments(promptState, {
@@ -663,7 +656,9 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
   env.SYSTEM_PROMPT = promptState.systemPrompt;
 
   // Corpus build #1 (initial review owns the primary artifact slot).
-  const profileKey: "primary" | "smart" = env.REVIEW_CONTEXT_PROFILE === "smart" ? "smart" : "primary";
+  // #965: the first pass is always the primary profile — the smart tier is
+  // selected at escalation, not before the review runs.
+  const profileKey: "primary" | "smart" = "primary";
   let corpusResult = assembleCorpus(ws, env, budgets, profileKey, "primary", generatedPaths, standards);
   ws.write("review-corpus.truncated.md", ws.read(corpusResult.outputName) ?? new Uint8Array(0));
 
@@ -842,8 +837,8 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
       ws.write("tool-harness.json", toolGate.json);
     } else {
       log(`Running tool harness in mode: ${toolMode}`);
-      // The tier names the first-pass artifact slot. On a direct smart route
-      // the loop limits follow REVIEW_CONTEXT_PROFILE (loopLimitsProfile).
+      // The tier names the first-pass artifact slot; the loop limits follow
+      // the tier (loopLimitsProfile).
       env.TOOL_HARNESS_TIER = "primary";
       await runToolHarnessPhase(ws, env, workspace, log);
     }
@@ -1430,7 +1425,7 @@ function tierProfileFrom(profiles: TierProfiles, tier: "primary" | "fallback" | 
     connectTimeoutSec: resolved.connectTimeoutSec,
     retries: resolved.retries,
     retryDelaySec: resolved.retryDelaySec,
-    shape: tierRequestShape(tier === "smart" ? "smart" : tier === "fallback" ? "fallback" : (env.REVIEW_CONTEXT_PROFILE === "smart" ? "smart" : "primary"), env),
+    shape: tierRequestShape(tier === "smart" ? "smart" : tier === "fallback" ? "fallback" : "primary", env),
     maxTokens: aiMaxTokens,
     temperature: temperatureRaw === "" ? "" : Number(temperatureRaw) || 0.1,
     responseFormat: (env.AI_RESPONSE_FORMAT ?? "off") as TierProfile["responseFormat"],
@@ -1530,7 +1525,9 @@ async function producePrimaryReview(input: ReviewCallInput & {
   const { env, ws, profiles, log, errorLog, budgets } = input;
   const toolMode = (env.TOOL_MODE ?? "off").toLowerCase();
   const harness = safeJson(ws.read("tool-harness.json"));
-  const firstTier = env.REVIEW_ROUTE === "smart" ? "smart" : "primary";
+  // #965: the first pass is always the primary tier — the resolver never
+  // emits "smart", and the code encodes that instead of trusting it.
+  const firstTier = "primary" as const;
   const firstProfile = tierProfileFrom(profiles, firstTier, env);
 
   // native_loop in-conversation verdict (#205/#637): parse the harness's own
@@ -1569,9 +1566,9 @@ async function producePrimaryReview(input: ReviewCallInput & {
   }
 
   const engineBase = analysisEngineBase(firstProfile.model, firstProfile.baseUrl, firstProfile.apiFormat);
-  // The *.primary.json names are the first-pass slot, not the model: a direct
-  // smart route writes its request here too. Read the model from the request
-  // body or the analysis-engine line, never from the filename.
+  // The *.primary.json names are the first-pass slot, not the model. Read
+  // the model from the request body or the analysis-engine line, never from
+  // the filename.
   const primary = await callTier(firstTier, firstProfile, input, "review-corpus.truncated.md", "ai-request.primary.json", "ai-response.primary.json");
   if (primary.ok) {
     log(`${firstProfile.label} model succeeded`);
@@ -1596,9 +1593,9 @@ async function producePrimaryReview(input: ReviewCallInput & {
 
   errorLog(`${firstProfile.label} model unavailable after retries; trying fallback: ${profiles.fallback.model} @ ${profiles.fallback.baseUrl} (${profiles.fallback.apiFormat})`);
   // #368: the fallback re-truncates the initial corpus. #940: the bound is
-  // the declared fallback capacity — #922 caps only the primary tier, so a
-  // direct smart route can assemble a corpus far beyond a smaller fallback's
-  // window — never above the historical 120000-byte constant.
+  // the declared fallback capacity — the fallback window can be smaller
+  // than the primary tier's — never above the historical 120000-byte
+  // constant.
   const fallbackCorpusBudget = budgets.fallback !== null
     ? Math.min(120000, budgets.fallback.maxCorpus)
     : 120000;
@@ -1661,11 +1658,31 @@ async function runSmartReview(input: SmartReviewInput): Promise<{ ok: boolean }>
       ws.write("tool-harness.smart.json", '{"tier":"smart","mode":"native_loop","skipped":true,"skip_reason":"fork-pr","rounds":0,"planned_request_count":0,"executed_request_count":0,"tool_results":[]}\n');
       log("Smart tool harness skipped for a cross-repository pull request.");
     } else {
+      // Build the smart-tier corpus BEFORE the harness: the native loop
+      // plans its investigation from review-corpus.smart.truncated.md
+      // (#969 — the primary flow builds its corpus before the harness too).
+      const prebuild = assembleCorpus(ws, input.env as StageEnv, input.budgets, "smart", "smart", input.generatedPaths, input.standards);
+      if (prebuild.overBudget) errorLog("ERROR: assembled smart corpus exceeds its context budget");
+      // The tier-smart harness reads its endpoint from the SMART_* env keys
+      // (tier-keyed, unlike the AI_* transport the loop uses at tier
+      // primary); bind the resolved smart profile for the harness phase.
+      const smartEnvKeys = ["SMART_BASE_URL", "SMART_MODEL", "SMART_API_FORMAT", "SMART_API_KEY"] as const;
+      const savedSmartEnv = smartEnvKeys.map((key) => [key, env[key]] as const);
+      env.SMART_BASE_URL = profiles.smart.baseUrl;
+      env.SMART_MODEL = profiles.smart.model;
+      env.SMART_API_FORMAT = profiles.smart.apiFormat;
+      env.SMART_API_KEY = profiles.smart.apiKey;
       env.TOOL_HARNESS_TIER = "smart";
       try {
         await runToolHarnessPhase(ws, env, input.workspace, log);
-      } catch {
+      } catch (cause) {
+        errorLog(`smart tool harness failed: ${cause instanceof Error ? cause.message : String(cause)}`);
         ws.write("tool-harness.smart.json", '{"tier":"smart","mode":"native_loop","error":"execution failed","stop_reason":"request-error","rounds":0,"planned_request_count":0,"executed_request_count":0,"tool_results":[]}\n');
+      } finally {
+        for (const [key, value] of savedSmartEnv) {
+          if (value === undefined) delete env[key];
+          else env[key] = value;
+        }
       }
       const smartHarness = safeJson(ws.read("tool-harness.smart.json")) ?? {};
       const status = String(smartHarness.stop_reason ?? smartHarness.native_loop_degraded ?? "");
@@ -1689,8 +1706,8 @@ async function runSmartReview(input: SmartReviewInput): Promise<{ ok: boolean }>
     }
   }
 
-  // Build the smart-tier corpus (slot smart → dedicated artifact names) and
-  // call the smart tier.
+  // Rebuild the smart-tier corpus with the harness's tool evidence included
+  // (slot smart → dedicated artifact names) and call the smart tier.
   const build = assembleCorpus(ws, input.env as StageEnv, input.budgets, "smart", "smart", input.generatedPaths, input.standards);
   if (build.overBudget) errorLog("ERROR: assembled smart corpus exceeds its context budget");
   const smartProfile = tierProfileFrom(profiles, "smart", env);
@@ -1734,7 +1751,7 @@ function writeStepSummary(stepSummaryPath: string, input: SummaryInput): void {
   const total = typeof coverageSummary.total === "number" ? coverageSummary.total : 0;
   const unknown = typeof coverageSummary.unknown === "number" ? coverageSummary.unknown : 0;
 
-  const profileKey = input.route === "escalated" || env.REVIEW_CONTEXT_PROFILE === "smart" ? "smart" : "primary";
+  const profileKey = input.route === "escalated" ? "smart" : "primary";
   const budget = input.budgets[profileKey];
   const corpusName = input.route === "escalated" ? "review-corpus.smart.truncated.md" : "review-corpus.truncated.md";
   const corpusBytes = byteLength(ws.read(corpusName));
