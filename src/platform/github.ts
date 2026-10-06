@@ -120,6 +120,31 @@ export class GitHubAdapter implements PlatformReadAdapter {
   }
 
 
+  /** `gh api <path> --paginate` (#971): follow every Link target, merging
+   * array pages in order. Any failed page fails the whole read. */
+  private async paginatedRestArray(url: string | null): Promise<ReadResult<unknown[]>> {
+    if (url === null) return { ok: false, error: "Refusing a request outside the repository" };
+    const merged: unknown[] = [];
+    for (let page = 0; url !== null; page += 1) {
+      if (page >= MAX_PAGES) return { ok: false, error: `pagination exceeded ${MAX_PAGES} pages` };
+      try {
+        // requestText binds every page (including Link targets) to the
+        // validated origin, so a hostile Link header cannot redirect the token.
+        const target: string = url;
+        const captured = await requestText(target, this.options());
+        if (captured.status < 200 || captured.status >= 300) return { ok: false, error: `GitHub API error: ${captured.status}` };
+        const parsed = parseJson(captured.text);
+        if (!parsed.ok || !Array.isArray(parsed.data)) return { ok: false, error: "GitHub API returned a non-array page" };
+        merged.push(...parsed.data);
+        const next = nextLink(captured.headers.get("link"));
+        url = next === null ? null : new URL(next, target).toString();
+      } catch (error) {
+        return { ok: false, error: errorText(error) };
+      }
+    }
+    return { ok: true, data: merged };
+  }
+
   /** `gh api <path>`: ok only on a 2xx JSON body (gh exits nonzero on HTTP
    * errors, and the seam's callers treat that as a failed read). */
   private async restJson(url: string | null): Promise<ReadResult<unknown>> {
@@ -235,49 +260,35 @@ export class GitHubAdapter implements PlatformReadAdapter {
   async listIssueComments(): Promise<ManagedComment[]> {
     const url = this.repoUrl("/issues/", `${this.prNumber}/comments?per_page=100`);
     if (url === null) return [];
-    try {
-      const { status, data } = await requestJson(
-        url,
-        this.options(),
-      );
-      if (status !== 200 || !Array.isArray(data)) return [];
-      return data.map((item): ManagedComment => {
-        const record = item !== null && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>) : {};
-        const comment: ManagedComment = {
-          body: typeof record.body === "string" ? record.body : "",
-          author: githubAuthor(item),
-        };
-        if (typeof record.id === "number" || typeof record.id === "string") comment.id = record.id;
-        if (typeof record.created_at === "string") comment.created_at = record.created_at;
-        if (typeof record.updated_at === "string") comment.updated_at = record.updated_at;
-        return comment;
-      });
-    } catch {
-      return [];
-    }
+    const result = await this.paginatedRestArray(url);
+    if (!result.ok) return [];
+    return result.data.map((item): ManagedComment => {
+      const record = item !== null && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>) : {};
+      const comment: ManagedComment = {
+        body: typeof record.body === "string" ? record.body : "",
+        author: githubAuthor(item),
+      };
+      if (typeof record.id === "number" || typeof record.id === "string") comment.id = record.id;
+      if (typeof record.created_at === "string") comment.created_at = record.created_at;
+      if (typeof record.updated_at === "string") comment.updated_at = record.updated_at;
+      return comment;
+    });
   }
 
   async listPrReviews(): Promise<ManagedReview[]> {
     const url = this.repoUrl("/pulls/", `${this.prNumber}/reviews?per_page=100`);
     if (url === null) return [];
-    try {
-      const { status, data } = await requestJson(
-        url,
-        this.options(),
-      );
-      if (status !== 200 || !Array.isArray(data)) return [];
-      return data.map((item): ManagedReview => {
-        const record = item !== null && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>) : {};
-        const review: ManagedReview = {
-          body: typeof record.body === "string" ? record.body : "",
-          author: githubAuthor(item),
-        };
-        if (typeof record.submitted_at === "string") review.submitted_at = record.submitted_at;
-        return review;
-      });
-    } catch {
-      return [];
-    }
+    const result = await this.paginatedRestArray(url);
+    if (!result.ok) return [];
+    return result.data.map((item): ManagedReview => {
+      const record = item !== null && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>) : {};
+      const review: ManagedReview = {
+        body: typeof record.body === "string" ? record.body : "",
+        author: githubAuthor(item),
+      };
+      if (typeof record.submitted_at === "string") review.submitted_at = record.submitted_at;
+      return review;
+    });
   }
 
   /** #970: `query { viewer { login } }` — the login this credential
@@ -358,27 +369,7 @@ export class GitHubAdapter implements PlatformReadAdapter {
    * `per_page=100`, follows `Link: rel="next"`, and merges the page arrays
    * into one array. Any failed page fails the read (gh exits nonzero). */
   async listPrReviewsPaginated(): Promise<ReadResult<unknown[]>> {
-    const merged: unknown[] = [];
-    let url: string | null = this.repoUrl("/pulls/", `${this.prNumber}/reviews?per_page=100`);
-    if (url === null) return { ok: false, error: "Refusing a request outside the repository" };
-    for (let page = 0; url !== null; page += 1) {
-      if (page >= MAX_PAGES) return { ok: false, error: `pagination exceeded ${MAX_PAGES} pages` };
-      try {
-        // requestText binds every page (including Link targets) to the
-        // validated origin, so a hostile Link header cannot redirect the token.
-        const target: string = url;
-        const captured = await requestText(target, this.options());
-        if (captured.status < 200 || captured.status >= 300) return { ok: false, error: `GitHub API error: ${captured.status}` };
-        const parsed = parseJson(captured.text);
-        if (!parsed.ok || !Array.isArray(parsed.data)) return { ok: false, error: "GitHub API returned a non-array review page" };
-        merged.push(...parsed.data);
-        const next = nextLink(captured.headers.get("link"));
-        url = next === null ? null : new URL(next, target).toString();
-      } catch (error) {
-        return { ok: false, error: errorText(error) };
-      }
-    }
-    return { ok: true, data: merged };
+    return this.paginatedRestArray(this.repoUrl("/pulls/", `${this.prNumber}/reviews?per_page=100`));
   }
 
   /** `platform_external_checks`: bounded check-runs + combined-status reads
