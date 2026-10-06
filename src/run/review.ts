@@ -1525,7 +1525,9 @@ async function producePrimaryReview(input: ReviewCallInput & {
   const { env, ws, profiles, log, errorLog, budgets } = input;
   const toolMode = (env.TOOL_MODE ?? "off").toLowerCase();
   const harness = safeJson(ws.read("tool-harness.json"));
-  const firstTier = env.REVIEW_ROUTE === "smart" ? "smart" : "primary";
+  // #965: the first pass is always the primary tier — the resolver never
+  // emits "smart", and the code encodes that instead of trusting it.
+  const firstTier = "primary" as const;
   const firstProfile = tierProfileFrom(profiles, firstTier, env);
 
   // native_loop in-conversation verdict (#205/#637): parse the harness's own

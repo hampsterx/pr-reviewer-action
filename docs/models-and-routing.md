@@ -55,11 +55,11 @@ Set `ai-api-format: anthropic` to post to `/messages` instead of `/chat/completi
     publish-review-comment: "true"
 ```
 
-`ai-api-format` has a matching sibling for every model slot: `ai-fallback-api-format`, `ai-primary-api-format`, `ai-smart-api-format`. Each defaults to blank, which inherits `ai-api-format` — so a routed smart endpoint on a different provider format must set its own.
+`ai-api-format` has a matching sibling for every model slot: `ai-fallback-api-format`, `ai-primary-api-format`, `ai-smart-api-format`. Each defaults to blank, which inherits `ai-api-format` — so a smart endpoint on a different provider format must set its own.
 
 ### Fallback model
 
-`ai-fallback-*` configures an availability fallback, not an escalation target — it only catches the first-pass model's endpoint being unreachable or erroring out. That is the primary model, or the smart model when risk flags route the review to it directly:
+`ai-fallback-*` configures an availability fallback, not an escalation target — it only catches the primary model's endpoint being unreachable or erroring out (the first pass is always primary under the #965 routing policy; smart runs only as the reviewer-requested rerun, whose failure publishes the primary review rather than falling back):
 
 ```yaml
 - uses: misospace/pr-reviewer-action@v3
