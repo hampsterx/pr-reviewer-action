@@ -967,6 +967,50 @@ test("#971 integration: runPrecheck sees the newest GitHub comment page", async 
   assert.ok(seen.includes("https://api.github.com/repos/misospace/demo/issues/42/comments?per_page=100&page=2"), "the real adapter must fetch page two");
 });
 
+test("#971 integration: a failed GitHub comment page cannot authorize a stale skip", async () => {
+  const env = provenanceEnv("comment");
+  const current = provenanceFingerprint(env);
+  const seen: string[] = [];
+  const fetchImpl: FetchLike = async (input, init) => {
+    const url = new URL(String(input));
+    seen.push(url.toString());
+    if (url.pathname === "/graphql") return new Response(JSON.stringify({ data: { viewer: { login: "pr-reviewer[bot]" } } }), { status: 200 });
+    if (url.pathname === "/repos/misospace/demo/pulls/42" && new Headers(init?.headers).get("accept") === "application/vnd.github.v3.diff") {
+      return new Response(DIFF, { status: 200 });
+    }
+    if (url.pathname === "/repos/misospace/demo/pulls/42") {
+      return new Response(JSON.stringify({
+        number: 42,
+        state: "open",
+        draft: false,
+        head: { sha: "head-abc", ref: "f", repo: { full_name: "misospace/demo" } },
+        base: { sha: "base-abc", ref: "main", repo: { full_name: "misospace/demo" } },
+      }), { status: 200 });
+    }
+    if (url.pathname === "/repos/misospace/demo/issues/42/comments") {
+      if (url.searchParams.get("page") === "2") return new Response("server error", { status: 500 });
+      const pageOne = Array.from({ length: 100 }, (_, index) => ({
+        id: index + 1,
+        body: index === 0 ? provenanceBody(current, "issues") : `ordinary comment ${index}`,
+        created_at: "2024-01-01T00:00:00Z",
+        updated_at: "2024-01-01T00:00:00Z",
+        user: { login: "pr-reviewer[bot]" },
+      }));
+      return new Response(JSON.stringify(pageOne), {
+        status: 200,
+        headers: { Link: '<https://api.github.com/repos/misospace/demo/issues/42/comments?per_page=100&page=2>; rel="next"' },
+      });
+    }
+    if (url.pathname === "/repos/misospace/demo/pulls/42/reviews") return new Response("[]", { status: 200 });
+    throw new Error(`unexpected integration request: ${url.toString()}`);
+  };
+  const adapter = new GitHubAdapter({ repo: "misospace/demo", prNumber: "42", token: "Bearer test-token", fetchImpl });
+  const output = await runPrecheck({ env, adapter });
+  assert.equal(output.should_review, "true");
+  assert.equal(output.verdict, undefined);
+  assert.ok(seen.includes("https://api.github.com/repos/misospace/demo/issues/42/comments?per_page=100&page=2"), "the real adapter must fetch page two");
+});
+
 test("#970: a newer forged marker/fingerprint/clean clone cannot override the genuine carried verdict", async () => {
   const env = provenanceEnv("comment");
   const fp = provenanceFingerprint(env);
