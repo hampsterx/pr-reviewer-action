@@ -837,8 +837,8 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
       ws.write("tool-harness.json", toolGate.json);
     } else {
       log(`Running tool harness in mode: ${toolMode}`);
-      // The tier names the first-pass artifact slot. On a direct smart route
-      // the loop limits follow REVIEW_CONTEXT_PROFILE (loopLimitsProfile).
+      // The tier names the first-pass artifact slot; the loop limits follow
+      // the tier (loopLimitsProfile).
       env.TOOL_HARNESS_TIER = "primary";
       await runToolHarnessPhase(ws, env, workspace, log);
     }
@@ -1564,9 +1564,9 @@ async function producePrimaryReview(input: ReviewCallInput & {
   }
 
   const engineBase = analysisEngineBase(firstProfile.model, firstProfile.baseUrl, firstProfile.apiFormat);
-  // The *.primary.json names are the first-pass slot, not the model: a direct
-  // smart route writes its request here too. Read the model from the request
-  // body or the analysis-engine line, never from the filename.
+  // The *.primary.json names are the first-pass slot, not the model. Read
+  // the model from the request body or the analysis-engine line, never from
+  // the filename.
   const primary = await callTier(firstTier, firstProfile, input, "review-corpus.truncated.md", "ai-request.primary.json", "ai-response.primary.json");
   if (primary.ok) {
     log(`${firstProfile.label} model succeeded`);
@@ -1591,9 +1591,9 @@ async function producePrimaryReview(input: ReviewCallInput & {
 
   errorLog(`${firstProfile.label} model unavailable after retries; trying fallback: ${profiles.fallback.model} @ ${profiles.fallback.baseUrl} (${profiles.fallback.apiFormat})`);
   // #368: the fallback re-truncates the initial corpus. #940: the bound is
-  // the declared fallback capacity — #922 caps only the primary tier, so a
-  // direct smart route can assemble a corpus far beyond a smaller fallback's
-  // window — never above the historical 120000-byte constant.
+  // the declared fallback capacity — the fallback window can be smaller
+  // than the primary tier's — never above the historical 120000-byte
+  // constant.
   const fallbackCorpusBudget = budgets.fallback !== null
     ? Math.min(120000, budgets.fallback.maxCorpus)
     : 120000;
@@ -1656,11 +1656,31 @@ async function runSmartReview(input: SmartReviewInput): Promise<{ ok: boolean }>
       ws.write("tool-harness.smart.json", '{"tier":"smart","mode":"native_loop","skipped":true,"skip_reason":"fork-pr","rounds":0,"planned_request_count":0,"executed_request_count":0,"tool_results":[]}\n');
       log("Smart tool harness skipped for a cross-repository pull request.");
     } else {
+      // Build the smart-tier corpus BEFORE the harness: the native loop
+      // plans its investigation from review-corpus.smart.truncated.md
+      // (#969 — the primary flow builds its corpus before the harness too).
+      const prebuild = assembleCorpus(ws, input.env as StageEnv, input.budgets, "smart", "smart", input.generatedPaths, input.standards);
+      if (prebuild.overBudget) errorLog("ERROR: assembled smart corpus exceeds its context budget");
+      // The tier-smart harness reads its endpoint from the SMART_* env keys
+      // (tier-keyed, unlike the AI_* transport the loop uses at tier
+      // primary); bind the resolved smart profile for the harness phase.
+      const smartEnvKeys = ["SMART_BASE_URL", "SMART_MODEL", "SMART_API_FORMAT", "SMART_API_KEY"] as const;
+      const savedSmartEnv = smartEnvKeys.map((key) => [key, env[key]] as const);
+      env.SMART_BASE_URL = profiles.smart.baseUrl;
+      env.SMART_MODEL = profiles.smart.model;
+      env.SMART_API_FORMAT = profiles.smart.apiFormat;
+      env.SMART_API_KEY = profiles.smart.apiKey;
       env.TOOL_HARNESS_TIER = "smart";
       try {
         await runToolHarnessPhase(ws, env, input.workspace, log);
-      } catch {
+      } catch (cause) {
+        errorLog(`smart tool harness failed: ${cause instanceof Error ? cause.message : String(cause)}`);
         ws.write("tool-harness.smart.json", '{"tier":"smart","mode":"native_loop","error":"execution failed","stop_reason":"request-error","rounds":0,"planned_request_count":0,"executed_request_count":0,"tool_results":[]}\n');
+      } finally {
+        for (const [key, value] of savedSmartEnv) {
+          if (value === undefined) delete env[key];
+          else env[key] = value;
+        }
       }
       const smartHarness = safeJson(ws.read("tool-harness.smart.json")) ?? {};
       const status = String(smartHarness.stop_reason ?? smartHarness.native_loop_degraded ?? "");
@@ -1684,8 +1704,8 @@ async function runSmartReview(input: SmartReviewInput): Promise<{ ok: boolean }>
     }
   }
 
-  // Build the smart-tier corpus (slot smart → dedicated artifact names) and
-  // call the smart tier.
+  // Rebuild the smart-tier corpus with the harness's tool evidence included
+  // (slot smart → dedicated artifact names) and call the smart tier.
   const build = assembleCorpus(ws, input.env as StageEnv, input.budgets, "smart", "smart", input.generatedPaths, input.standards);
   if (build.overBudget) errorLog("ERROR: assembled smart corpus exceeds its context budget");
   const smartProfile = tierProfileFrom(profiles, "smart", env);

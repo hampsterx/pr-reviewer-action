@@ -125,9 +125,9 @@ export function resolveTierBudgets(inputs: BudgetInputs): {
   smart: TierBudgets;
   /** #940: the fallback tier's own derivation, or null when no fallback
    * window is declared. #922 caps the primary tier with these budgets, but
-   * the smart tier is returned uncapped — a direct smart route can assemble
-   * a corpus far beyond a smaller fallback's capacity, so the recovery
-   * request reads its bound from here. */
+   * the smart tier is returned uncapped — the smart tier's declared window
+   * can exceed a smaller fallback's capacity, so the recovery request reads
+   * its bound from here. */
   fallback: TierBudgets | null;
 } {
   const aiMaxTokens = inputs.aiMaxTokens !== undefined && inputs.aiMaxTokens !== ""

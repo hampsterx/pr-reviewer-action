@@ -610,6 +610,115 @@ test("#965: auto routing escalates only after the primary reviewer requests it",
   }
 });
 
+test("#969: native_loop + smart_review_requested escalates through a working smart harness", async () => {
+  // The smart tier's native loop plans from review-corpus.smart.truncated.md;
+  // #969 builds it BEFORE the harness (and rebuilds it after, for the
+  // plain-call path below). Without the pre-build the smart harness starts
+  // with no planning corpus and the escalation dies.
+  const scripted = (marker: string, extra: Record<string, unknown> = {}, opts: { breakVerdictTurn?: boolean } = {}) => {
+    let calls = 0;
+    return (_req: unknown, body: string, res: { setHeader: (k: string, v: string) => void; end: (b: string) => void }) => {
+      calls += 1;
+      res.setHeader("Content-Type", "application/json");
+      const req = JSON.parse(body) as { tools?: unknown[] };
+      const hasTools = Array.isArray(req.tools) && req.tools.length > 0;
+      if (calls === 1 && hasTools) {
+        res.end(JSON.stringify({
+          id: "c0", object: "chat.completion", model: "x",
+          choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{ id: "t1", type: "function", function: { name: "read_file", arguments: '{"path":"README.md"}' } }] } }],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        }));
+        return;
+      }
+      // A no-tools response that carries no choices cannot produce a reusable
+      // native verdict — it drives the harness into the fall-through path.
+      if (opts.breakVerdictTurn === true && !hasTools && calls === 2) {
+        res.end(JSON.stringify({ choices: [] }));
+        return;
+      }
+      res.end(verdictBody(baseVerdict({ review_markdown: `${marker}\n`, ...extra })));
+    };
+  };
+  const { runDir, cleanup } = withRunDir();
+  try {
+    writeFileSync(join(runDir, "README.md"), "SMART-CORPUS-969 evidence marker\n");
+    gitInit(runDir);
+    const base = {
+      "github-token": "tok", repo: "o/r", "pr-number": "7",
+      "ai-stream": "false", "review-routing-mode": "auto", "tool-mode": "native_loop", "deep-review": "false",
+    };
+
+    // (a) The smart harness completes and its verdict publishes as escalated.
+    const primaryServer = await startMockServer(scripted("Primary review.", { smart_review_requested: true, smart_review_reason: "tool coverage gap" }));
+    const smartServer = await startMockServer(scripted("Escalated review."));
+    try {
+      const result = await runReview({
+        env: { IS_FORK_PR: "false" },
+        inputs: {
+          ...base,
+          "ai-base-url": primaryServer.url, "ai-model": "primary-m", "ai-api-key": "primary-key",
+          "ai-smart-base-url": smartServer.url, "ai-smart-model": "smart-m", "ai-smart-api-key": "smart-key",
+        },
+        runDir, workspace: runDir,
+        platformAdapter: mockPlatform(), quiet: true,
+      });
+      assert.equal(result.outputs.reviewRoute, "escalated");
+      assert.equal(result.outputs.escalationReason, "primary_requested");
+      assert.match(result.outputs.reviewMarkdown, /Escalated review\./);
+      assert.ok(existsSync(join(runDir, "review-corpus.smart.truncated.md")), "the smart corpus must exist before the smart harness plans from it");
+      const smartHarness = JSON.parse(readFileSync(join(runDir, "tool-harness.smart.json"), "utf8")) as { executed_request_count?: number; stop_reason?: string; native_loop_verdict_status?: string; tool_results?: Array<{ result?: { content?: string } }> };
+      assert.equal(smartHarness.stop_reason, "model-stopped");
+      assert.equal(smartHarness.native_loop_verdict_status, "accepted", "the smart harness must produce a reusable verdict");
+      assert.ok((smartHarness.executed_request_count ?? 0) >= 1, "the smart harness must run its tool turn");
+      assert.ok(
+        (smartHarness.tool_results ?? []).some((call) => (call.result?.content ?? "").includes("SMART-CORPUS-969 evidence marker")),
+        "the smart harness must actually have read the changed file",
+      );
+      assert.equal(primaryServer.requests.length, 3, "the primary review's own native loop runs on the primary endpoint (tool turn + verdict turns); escalation calls land on the smart endpoint");
+      assert.ok(primaryServer.requests.every((request) => request.headers.authorization === "Bearer primary-key"));
+      assert.ok(smartServer.requests.length >= 2);
+      assert.ok(smartServer.requests.every((request) => request.headers.authorization === "Bearer smart-key"));
+    } finally {
+      await primaryServer.close();
+      await smartServer.close();
+    }
+
+    // (b) Harness verdict unavailable (the verdict turn returns no usable
+    // body): the plain smart call must carry the tool evidence from the
+    // rebuilt smart corpus.
+    const primaryServerB = await startMockServer(scripted("Primary review.", { smart_review_requested: true, smart_review_reason: "tool coverage gap" }));
+    const smartServerB = await startMockServer(scripted("Escalated review.", {}, { breakVerdictTurn: true }));
+    const { runDir: runDirB, cleanup: cleanupB } = withRunDir();
+    try {
+      writeFileSync(join(runDirB, "README.md"), "SMART-CORPUS-969 evidence marker\n");
+      gitInit(runDirB);
+      const resultB = await runReview({
+        env: { IS_FORK_PR: "false" },
+        inputs: {
+          ...base,
+          "ai-base-url": primaryServerB.url, "ai-model": "primary-m", "ai-api-key": "primary-key",
+          "ai-smart-base-url": smartServerB.url, "ai-smart-model": "smart-m", "ai-smart-api-key": "smart-key",
+          "tool-max-requests": "1",
+        },
+        runDir: runDirB, workspace: runDirB,
+        platformAdapter: mockPlatform(), quiet: true,
+      });
+      assert.equal(resultB.outputs.reviewRoute, "escalated");
+      assert.match(resultB.outputs.reviewMarkdown, /Escalated review\./);
+      const request = JSON.parse(readFileSync(join(runDirB, "ai-request.smart.json"), "utf8")) as { messages?: Array<{ content?: string }> };
+      const corpusText = JSON.stringify(request.messages ?? []);
+      assert.ok(corpusText.includes("SMART-CORPUS-969 evidence marker"), "the final smart call must include the tool evidence gathered by the smart harness");
+      assert.ok(existsSync(join(runDirB, "tool-harness.smart.json")));
+    } finally {
+      await primaryServerB.close();
+      await smartServerB.close();
+      cleanupB();
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 test("#965: auto routing starts on primary even for an auth-risk PR", async () => {
   const primaryServer = await startMockServer((_req, _body, res) => {
     res.setHeader("Content-Type", "application/json");

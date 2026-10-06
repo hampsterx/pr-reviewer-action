@@ -109,6 +109,6 @@ A set of older heuristic triggers from `src/routing/escalation.ts` are **depreca
 - `fast_request_changes`, `fast_low_confidence`, `tool_or_evidence_blockers`, `incomplete_required_checks`, `tool_planning_failed`.
 - The autonomous incomplete-requirement-coverage retry is removed entirely; unknown coverage stays visible in the coverage artifact and step summary, and the primary reviewer may fold it into its own `smart_review_requested` decision.
 
-Unchanged: first-pass failure (primary) → fallback as an availability recovery (never an escalation target), and deterministic enforcement running independent of escalation. Changed by #965: there is no direct smart route before the primary runs anymore — `escalate-on-risk-flags` is gone, so the only smart call is the reviewer-requested rerun below.
+Fallback remains availability recovery, never an escalation target, and deterministic enforcement runs independent of escalation.
 
 Only the **final** review is published. If the smart model fails, the primary review publishes instead — escalation never turns into a failed run. `review-route` reports `escalated` and `escalation-reason` carries `primary_requested`; both land in the step summary, the managed metadata marker, and the published review's `_Analysis engine:_` line (`— primary route` vs `— escalated (…)` vs `— fallback (primary failed)`), so you can tell a deliberate escalation from an availability fallback at a glance. Worst case is two model calls per review; the unchanged-diff skip keeps that bounded across runs.

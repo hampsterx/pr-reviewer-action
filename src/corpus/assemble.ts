@@ -6,9 +6,9 @@
  * - the smart tier rebuilds its diff/file sections from the RAW `pr.diff` and
  *   `pr-files.json` under the SMART budgets — never from the primary tier's
  *   already-truncated artifacts;
- * - the primary artifact slot stays primary under direct smart routing
- *   (tier=smart, slot=primary writes review-corpus.md and reads
- *   tool-harness.md); only the escalated smart review (tier=smart,
+ * - tier names the model profile and slot names the artifact slot: the
+ *   initial review is always tier=primary (writes review-corpus.md and reads
+ *   tool-harness.md), and only the escalated smart review (tier=smart,
  *   slot=smart) writes review-corpus.smart.truncated.md and the
  *   tool-harness.smart.md slot with the omission notice;
  * - reserved sections cannot be evicted: the standards section is capped
@@ -124,10 +124,8 @@ export interface CorpusBuildResult {
 }
 
 /** Workspace artifacts carrying `corpusDiffPayload` per artifact slot — the
- * slot the corpus alias carries, not the model tier (the direct-smart
- * initial review builds tier=smart into the primary slot and its harness
- * still runs at TOOL_HARNESS_TIER=primary). Written by the v3 run layer next
- * to the corpus alias, consumed by the #921 coverage rule in
+ * slot the corpus alias carries, not the model tier. Written by the v3 run
+ * layer next to the corpus alias, consumed by the #921 coverage rule in
  * src/tools/coverage.ts. */
 export const CORPUS_DIFF_SECTION_ARTIFACT = "pr.diff.corpus-section.txt";
 export const CORPUS_DIFF_SECTION_SMART_ARTIFACT = "pr.diff.smart.corpus-section.txt";
