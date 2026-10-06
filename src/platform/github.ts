@@ -39,6 +39,17 @@ function parseJson(text: string): { ok: true; data: unknown } | { ok: false } {
   }
 }
 
+/** #970: the forge-reported author login of a raw comment/review object
+ * (`user.login`). Never reads body content; a missing or non-string login is
+ * `undefined` (unproven ownership, which callers fail closed on). */
+function githubAuthor(item: unknown): string | undefined {
+  if (item === null || typeof item !== "object" || Array.isArray(item)) return undefined;
+  const user = (item as Record<string, unknown>).user;
+  if (user === null || typeof user !== "object" || Array.isArray(user)) return undefined;
+  const login = (user as Record<string, unknown>).login;
+  return typeof login === "string" && login !== "" ? login : undefined;
+}
+
 /** The `rel="next"` target of an RFC 8288 Link header, if any. */
 export function nextLink(header: string | null): string | null {
   if (!header) return null;
@@ -229,7 +240,18 @@ export class GitHubAdapter implements PlatformReadAdapter {
         url,
         this.options(),
       );
-      return status === 200 && Array.isArray(data) ? (data as ManagedComment[]) : [];
+      if (status !== 200 || !Array.isArray(data)) return [];
+      return data.map((item): ManagedComment => {
+        const record = item !== null && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>) : {};
+        const comment: ManagedComment = {
+          body: typeof record.body === "string" ? record.body : "",
+          author: githubAuthor(item),
+        };
+        if (typeof record.id === "number" || typeof record.id === "string") comment.id = record.id;
+        if (typeof record.created_at === "string") comment.created_at = record.created_at;
+        if (typeof record.updated_at === "string") comment.updated_at = record.updated_at;
+        return comment;
+      });
     } catch {
       return [];
     }
@@ -243,9 +265,63 @@ export class GitHubAdapter implements PlatformReadAdapter {
         url,
         this.options(),
       );
-      return status === 200 && Array.isArray(data) ? (data as ManagedReview[]) : [];
+      if (status !== 200 || !Array.isArray(data)) return [];
+      return data.map((item): ManagedReview => {
+        const record = item !== null && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>) : {};
+        const review: ManagedReview = {
+          body: typeof record.body === "string" ? record.body : "",
+          author: githubAuthor(item),
+        };
+        if (typeof record.submitted_at === "string") review.submitted_at = record.submitted_at;
+        return review;
+      });
     } catch {
       return [];
+    }
+  }
+
+  /** #970: `query { viewer { login } }` — the login this credential
+   * authenticates as. GraphQL is the only self-identity source that answers
+   * for a GitHub App installation token: REST `GET /user` returns 403
+   * "Resource not accessible by integration" for installation and
+   * `GITHUB_TOKEN` credentials. GraphQL returns the app's `<slug>[bot]`
+   * account, `github-actions[bot]` for `GITHUB_TOKEN`, and the user login for
+   * a PAT/OAuth token — so the action's own managed bodies are recognised
+   * without hardcoding an identity. */
+  private async graphqlViewerLogin(): Promise<string | null> {
+    try {
+      const { status, text } = await requestText(this.graphqlUrl(), {
+        ...this.options(),
+        method: "POST",
+        body: JSON.stringify({ query: "query { viewer { login } }" }),
+      });
+      if (status < 200 || status >= 300) return null;
+      const parsed = parseJson(text);
+      if (!parsed.ok) return null;
+      const viewer = (parsed.data as { data?: { viewer?: { login?: unknown } } } | null)?.data?.viewer;
+      const login = viewer?.login;
+      return typeof login === "string" && login.trim() !== "" ? login : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** #970: resolve the login this token posts as, failing closed (`null`) on
+   * any error — a missing token, transport failure, non-2xx answer, or an
+   * unusable payload. GraphQL `viewer` is tried first because it is the only
+   * source that works for installation tokens; REST `GET /user` is a fallback
+   * for credentials where GraphQL is unavailable. */
+  async authenticatedIdentity(): Promise<string | null> {
+    if (!this.token) return null;
+    const viewer = await this.graphqlViewerLogin();
+    if (viewer !== null) return viewer;
+    try {
+      const { status, data } = await requestJson(this.url("/user"), this.options("application/vnd.github.v3+json"));
+      if (status !== 200 || data === null || typeof data !== "object" || Array.isArray(data)) return null;
+      const login = (data as Record<string, unknown>).login;
+      return typeof login === "string" && login.trim() !== "" ? login : null;
+    } catch {
+      return null;
     }
   }
 

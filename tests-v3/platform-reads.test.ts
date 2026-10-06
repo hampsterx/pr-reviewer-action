@@ -376,6 +376,83 @@ test("forgejo reads make ZERO requests for a dot-segment repo ref", async () => 
   assert.equal(seen.length, 0);
 });
 
+// ── #970: forge-authenticated provenance ─────────────────────────────────
+
+test("#970: GitHub managed reads carry the forge-reported author login", async () => {
+  const { fetchImpl } = recorder((url) => {
+    if (url.pathname.endsWith("/comments")) {
+      return json([{ id: 1, body: "<!-- ai-pr-reviewer -->", created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-02T00:00:00Z", user: { login: "pr-reviewer[bot]" } }]);
+    }
+    return json([{ id: 2, body: "<!-- ai-pr-reviewer -->", submitted_at: "2024-01-02T00:00:00Z", user: { login: "pr-reviewer[bot]" } }]);
+  });
+  const adapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", token: "Bearer t", fetchImpl });
+  const comments = await adapter.listIssueComments();
+  assert.equal(comments[0]?.author, "pr-reviewer[bot]");
+  assert.equal(comments[0]?.body, "<!-- ai-pr-reviewer -->");
+  const reviews = await adapter.listPrReviews();
+  assert.equal(reviews[0]?.author, "pr-reviewer[bot]");
+  // A body with no usable user object is unproven, never a fabricated author.
+  const { fetchImpl: bare } = recorder(() => json([{ id: 3, body: "x" }]));
+  assert.equal((await new GitHubAdapter({ repo: "o/r", prNumber: "7", token: "Bearer t", fetchImpl: bare }).listIssueComments())[0]?.author, undefined);
+  // GitHub returns `user: null` for a deleted author — still unproven.
+  const { fetchImpl: deleted } = recorder(() => json([{ id: 4, body: "x", user: null }]));
+  assert.equal((await new GitHubAdapter({ repo: "o/r", prNumber: "7", token: "Bearer t", fetchImpl: deleted }).listIssueComments())[0]?.author, undefined);
+});
+
+test("#970: GitHub authenticatedIdentity uses GraphQL viewer (installation-token safe) with a REST /user fallback", async () => {
+  // GraphQL `viewer` answers for installation tokens, GITHUB_TOKEN, and PATs;
+  // REST GET /user 403s for installation tokens, so it must be tried second.
+  const gql = recorder((url) => url.pathname === "/graphql"
+    ? json({ data: { viewer: { login: "its-saffron[bot]" } } })
+    : json({ message: "Resource not accessible by integration" }, 403));
+  const adapter = new GitHubAdapter({ repo: "o/r", prNumber: "7", token: "Bearer t", fetchImpl: gql.fetchImpl });
+  assert.equal(await adapter.authenticatedIdentity(), "its-saffron[bot]");
+  assert.ok(gql.seen[0]?.url.endsWith("/graphql"));
+  assert.equal(gql.seen.length, 1, "no REST /user call is needed when GraphQL answers");
+
+  // REST /user fallback for credentials where GraphQL is unavailable.
+  const rest = recorder((url) => url.pathname === "/graphql"
+    ? json({ errors: [{ message: "GraphQL not available" }] })
+    : json({ login: "joryirving", type: "User" }));
+  const fallback = new GitHubAdapter({ repo: "o/r", prNumber: "7", token: "Bearer t", fetchImpl: rest.fetchImpl });
+  assert.equal(await fallback.authenticatedIdentity(), "joryirving");
+  assert.ok(rest.seen.some((entry) => entry.url.endsWith("/user")));
+
+  // No token: nothing to authenticate as.
+  assert.equal(await new GitHubAdapter({ repo: "o/r", prNumber: "7", fetchImpl: gql.fetchImpl }).authenticatedIdentity(), null);
+  // Transport failure on both.
+  const failing = new GitHubAdapter({ repo: "o/r", prNumber: "7", token: "Bearer t", fetchImpl: (async () => { throw new Error("boom"); }) as never });
+  assert.equal(await failing.authenticatedIdentity(), null);
+  // GraphQL 200 without a viewer; REST 200 without a usable login.
+  const unusable = new GitHubAdapter({
+    repo: "o/r", prNumber: "7", token: "Bearer t",
+    fetchImpl: recorder((url) => url.pathname === "/graphql" ? json({ data: {} }) : json({ id: 1 })).fetchImpl,
+  });
+  assert.equal(await unusable.authenticatedIdentity(), null);
+  // An explicit `viewer: null` falls through to REST, which then decides.
+  const nullViewer = new GitHubAdapter({
+    repo: "o/r", prNumber: "7", token: "Bearer t",
+    fetchImpl: recorder((url) => url.pathname === "/graphql" ? json({ data: { viewer: null } }) : json({ login: "fallback-user" })).fetchImpl,
+  });
+  assert.equal(await nullViewer.authenticatedIdentity(), "fallback-user");
+  // Both sources reject.
+  const denied = new GitHubAdapter({ repo: "o/r", prNumber: "7", token: "Bearer t", fetchImpl: recorder(() => json({ message: "Bad credentials" }, 401)).fetchImpl });
+  assert.equal(await denied.authenticatedIdentity(), null);
+});
+
+test("#970: Forgejo managed reads carry the author login and authenticatedIdentity resolves /user", async () => {
+  const { fetchImpl, seen } = recorder((url) => {
+    if (url.pathname.endsWith("/user")) return json({ login: "pr-reviewer" });
+    if (url.pathname.endsWith("/reviews")) return json([{ id: 2, body: "<!-- ai-pr-reviewer -->", user: { login: "pr-reviewer" } }]);
+    return json([{ id: 1, body: "<!-- ai-pr-reviewer -->", created_at: "2024-01-01T00:00:00Z", user: { login: "pr-reviewer" } }]);
+  });
+  const adapter = new ForgejoAdapter({ repo: "o/r", prNumber: "5", baseUrl: "https://git.example", token: "t", fetchImpl });
+  assert.equal((await adapter.listIssueComments())[0]?.author, "pr-reviewer");
+  assert.equal((await adapter.listPrReviews())[0]?.author, "pr-reviewer");
+  assert.equal(await adapter.authenticatedIdentity(), "pr-reviewer");
+  assert.ok(seen.some((entry) => entry.url.endsWith("/api/v1/user")));
+});
+
 test("enrichment clients make ZERO requests for a dot-segment repo ref or ref tail", async () => {
   const { fetchImpl, seen } = recorder(() => json({}));
   const github = new GitHubEnrichClient({ token: "Bearer t", fetchImpl });
