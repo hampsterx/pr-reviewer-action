@@ -26,7 +26,7 @@ import {
   type CorpusWorkspace,
 } from "../src/corpus/index.js";
 import { corpusDiffCoveredFiles } from "../src/tools/coverage.js";
-import { extractCorpusRegions } from "../src/tools/harness.js";
+import { buildPlanningContext, extractCorpusRegions } from "../src/tools/harness.js";
 import { dedupeVerdictCorpus } from "../src/model/conversation.js";
 
 const enc = (text: string): Uint8Array => Buffer.from(text, "utf8");
@@ -711,4 +711,19 @@ test("the PR Diff heading bounds the Version Hints region, so verdict dedup keep
   assert.ok(!hints.includes("SENTINEL_DIFF_LINE"), "the region stops at the diff heading");
   const verdict = dedupeVerdictCorpus(corpus, hints);
   assert.ok(verdict.includes("+SENTINEL_DIFF_LINE"), "the diff survives verdict dedup");
+});
+
+// The file-list heading is a planner key too: CORPUS_TITLES, the region
+// allow-list and the plan row all name it. If any copy drifts, the planner
+// quietly falls back to an excerpt of the files artifact instead.
+test("the PR Files heading is the planner's PR Files region, not the excerpt fallback", () => {
+  const ws = { ...baseWorkspace(), prFilesTruncatedJson: enc('[{"filename":"src/a.ts"}]\n') };
+  const corpus = dec(buildReviewCorpus(ws, baseOptions).artifacts.get("review-corpus.md")!);
+  const { text } = buildPlanningContext(
+    50000,
+    { env: {}, readText: (name) => (name === "corpus.md" ? corpus : null), renderSpecialistLeads: () => "" },
+    "corpus.md",
+  );
+  assert.ok(text.includes('# PR Files\n```json\n[{"filename":"src/a.ts"}]'), "the corpus region is used");
+  assert.ok(!text.includes("# Changed Files"), "not the excerpt fallback");
 });
