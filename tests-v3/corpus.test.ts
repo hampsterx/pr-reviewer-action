@@ -693,6 +693,35 @@ test("corpus diff and file-list headings make no truncation claim; a real cut ke
   assert.match(cutCorpus, /^# PR Diff$/m);
   assert.match(cutCorpus, cutMarkers, "the cut is still visible in-band");
   assert.ok(!cutCorpus.includes("…[review corpus truncated"), "fixture: only the diff budget cut, not the body");
+
+  // The file list carries its own byte-budget signal, so it needs the same
+  // mechanical pin: a small filesBudget cuts the list, and the cut stays
+  // visible in-band rather than moving into the heading.
+  const manyFiles = JSON.stringify(
+    Array.from({ length: 40 }, (_, i) => ({
+      filename: `src/very/long/path/to/module-${i}.ts`,
+      status: "modified",
+      additions: i,
+      deletions: i,
+      changes: i * 2,
+    })),
+  );
+  const filesCorpusAt = (filesBudget: number): string =>
+    dec(
+      buildReviewCorpus(
+        { ...baseWorkspace(), prFilesJson: enc(manyFiles) },
+        { ...baseOptions, tier: "smart", slot: "smart", filesBudget },
+      ).artifacts.get("review-corpus.smart.truncated.md")!,
+    );
+  const cutFilesCorpus = filesCorpusAt(400);
+  const cutFilesSection = extractCorpusRegions(cutFilesCorpus)["PR Files"] ?? "";
+  assert.match(cutFilesSection, /^# PR Files$/m);
+  assert.ok(cutFilesSection.includes("…[file list truncated]"), "the file-list cut is signalled in-band, inside the section");
+  assert.doesNotMatch(cutFilesCorpus, /^# PR Files \(/m);
+  assert.ok(
+    !(extractCorpusRegions(filesCorpusAt(baseOptions.filesBudget))["PR Files"] ?? "").includes("…[file list truncated]"),
+    "fixture: the default budget leaves the list whole, so the marker above is the cut",
+  );
 });
 
 // CORPUS_TITLES in the harness splits planning regions on these exact
