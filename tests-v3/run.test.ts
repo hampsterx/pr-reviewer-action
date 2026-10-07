@@ -133,7 +133,7 @@ test("runs the full review end to end: artifacts, outputs, marker", async () => 
     }
     // The corpus embeds the diff and the classification.
     const corpus = readFileSync(join(runDir, "review-corpus.truncated.md"), "utf8");
-    assert.match(corpus, /# PR Diff \(truncated\)/);
+    assert.match(corpus, /^# PR Diff$/m);
     assert.match(corpus, /# PR Classification/);
     assert.match(corpus, /# Repository Standards/);
     // GITHUB_OUTPUT got the kebab-case contract assignments.

@@ -539,7 +539,7 @@ const CORPUS_TITLES = new Set([
   "Changed Manifest Context", "PR Metadata", "PR Classification",
   "Related Code Context", "Repository Map", "Linked Issue Context", "Unresolved Review Threads",
   "Outstanding Human Change Requests",
-  "PR Files (truncated)", "Version Hints from Diff", "PR Diff (truncated)",
+  "PR Files", "Version Hints from Diff", "PR Diff",
   "Tool Harness Findings", "Evidence Providers", "CI Check Results",
   "Image Digest Provenance", "Linked Sources", "Repository Impact Scan",
   "Repository History", "Claims to Falsify", "Specialist Review Leads",
@@ -565,7 +565,7 @@ export function extractCorpusRegions(corpusText: string): Record<string, string>
   const bounds = [...starts, lines.length];
   for (let i = 0; i < starts.length; i++) {
     const title = (lines[starts[i]!] ?? "").slice(2).trim();
-    if (["PR Metadata", "PR Classification", "Linked Issue Context", "Related Code Context", "Repository Map", "PR Files (truncated)", "Version Hints from Diff", "Specialist Review Leads", "Claims to Falsify"].includes(title)) {
+    if (["PR Metadata", "PR Classification", "Linked Issue Context", "Related Code Context", "Repository Map", "PR Files", "Version Hints from Diff", "Specialist Review Leads", "Claims to Falsify"].includes(title)) {
       if (regions[title] === undefined) {
         regions[title] = lines.slice(starts[i]!, bounds[i + 1] ?? lines.length).join("\n").replace(/\s+$/, "");
       }
@@ -843,7 +843,7 @@ export function buildPlanningContext(
     ["Linked Issue Context", "Linked Issue Context", "linked-issues.md", 3000, null],
     ["Related Code Context", "Related Code Context", "related-code.truncated.md", 10000, null],
     ["Equivalent Paths", "Equivalent Paths to Compare", "equivalent-paths.truncated.md", 6000, null],
-    ["PR Files (truncated)", "Changed Files", "pr-files.truncated.json", 6000, "json"],
+    ["PR Files", "Changed Files", "pr-files.truncated.json", 6000, "json"],
     ["Version Hints from Diff", "Version Hints from Diff", "version-hints.truncated.txt", 2500, "text"],
     ["standards", "Repository Standards and Conventions", "standards-context.capped.md", 6000, null],
   ];

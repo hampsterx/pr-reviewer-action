@@ -74,7 +74,7 @@ test("missing corpus aborts pre-loop with the version-1 telemetry shape", async 
 
 test("missing model config aborts pre-loop as missing-config", async () => {
   const { root, deps } = workspace();
-  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff (truncated)\n+ x");
+  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff\n+ x");
   const d = deps();
   delete (d.env as Record<string, string>).AI_MODEL;
   const { result } = await runToolHarness(d);
@@ -84,7 +84,7 @@ test("missing model config aborts pre-loop as missing-config", async () => {
 
 test("no tool calls degrades to a corpus-only review without a verdict turn", async () => {
   const { root, deps } = workspace();
-  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff (truncated)\n+ x");
+  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff\n+ x");
   let transportCalls = 0;
   const { result } = await runToolHarness(deps({
     transport: async () => {
@@ -104,7 +104,7 @@ test("the loop gathers evidence and the in-conversation verdict is produced and 
   const { root, deps } = workspace();
   fs.writeFileSync(
     path.join(root, "review-corpus.truncated.md"),
-    "# PR Diff (truncated)\n+ change\n",
+    "# PR Diff\n+ change\n",
   );
   fs.writeFileSync(path.join(root, "src.ts"), "export const x = 1;\n");
   const scripted = [openAiCall("c1", "read_file", '{"path":"src.ts"}'), openAiText("evidence gathered"), validVerdict()];
@@ -133,7 +133,7 @@ test("the loop gathers evidence and the in-conversation verdict is produced and 
 
 test("an unusable verdict body leaves the produced flag unset so the standard review synthesizes it", async () => {
   const { root, deps } = workspace();
-  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff (truncated)\n+ change\n");
+  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff\n+ change\n");
   const scripted = [openAiCall("c1", "read_file", '{"path":"src.ts"}'), openAiText("summary"), openAiText("this is not json at all")];
   let transportCalls = 0;
   const { result } = await runToolHarness(deps({
@@ -149,7 +149,7 @@ test("an unusable verdict body leaves the produced flag unset so the standard re
 
 test("#868: a 200 verdict-turn reply carrying an in-body error masks the configured key everywhere it is logged or persisted", async () => {
   const { root, deps } = workspace();
-  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff (truncated)\n+ change\n");
+  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff\n+ change\n");
   const apiKey = "sk-configured-real-secret-98765";
   const patShaped = "ghp_" + "e".repeat(36);
   const scripted = [
@@ -194,7 +194,7 @@ test("#868 maintainer follow-up: a 200 verdict-turn reply that parses to {verdic
   // character presence; the long key gets the broad, unambiguous scan.
   for (const apiKey of ["sk-native-loop-long-configured-secret", "k"]) {
     const { root, deps } = workspace();
-    fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff (truncated)\n+ change\n");
+    fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff\n+ change\n");
     const scripted = [
       openAiCall("c1", "read_file", '{"path":"src.ts"}'),
       openAiText("summary"),
@@ -233,7 +233,7 @@ test("#868 maintainer follow-up: a 200 verdict-turn reply that parses to {verdic
 
 test("smart-tier tool failures fall back to the primary review without a smart verdict", async () => {
   const { root, deps } = workspace();
-  fs.writeFileSync(path.join(root, "review-corpus.smart.truncated.md"), "# PR Diff (truncated)\n+ change\n");
+  fs.writeFileSync(path.join(root, "review-corpus.smart.truncated.md"), "# PR Diff\n+ change\n");
   const env = {
     TOOL_HARNESS_TIER: "smart",
     REPO: "o/r",
@@ -266,7 +266,7 @@ test("smart-tier tool failures fall back to the primary review without a smart v
 
 test("smart-tier wall-clock exhaustion stops the loop with the deadline stop reason", async () => {
   const { root, deps } = workspace();
-  fs.writeFileSync(path.join(root, "review-corpus.smart.truncated.md"), "# PR Diff (truncated)\n+ change\n");
+  fs.writeFileSync(path.join(root, "review-corpus.smart.truncated.md"), "# PR Diff\n+ change\n");
   const env = {
     TOOL_HARNESS_TIER: "smart",
     REPO: "o/r",
@@ -303,7 +303,7 @@ test("invalid env integers crash loudly like v2's int()", async () => {
 });
 
 test("harness-findings section substitution and tool-request normalization helpers", () => {
-  const corpus = "# Tool Harness Findings\nTool harness planning pending.\n\n# PR Diff (truncated)\n+ x";
+  const corpus = "# Tool Harness Findings\nTool harness planning pending.\n\n# PR Diff\n+ x";
   const outcome = {
     executed: [{ tool: "read_file", args: { path: "a.ts" }, result: { status: "ok", result: {} } }],
     rounds: 1,
@@ -312,7 +312,7 @@ test("harness-findings section substitution and tool-request normalization helpe
   } as unknown as LoopOutcome;
   const replaced = replaceHarnessFindingsSection(corpus, verdictHarnessFindingsBody(outcome));
   assert.match(replaced, /# Tool Harness Findings\nThe tool harness ran for this review: 1 tool call\(s\)/);
-  assert.ok(replaced.includes("# PR Diff (truncated)"));
+  assert.ok(replaced.includes("# PR Diff"));
   assert.equal(replaceHarnessFindingsSection("# No Sections Here", "body"), "# No Sections Here");
   // Planner-repair tolerance: top-level params promoted, gh_api path alias.
   assert.deepEqual(
@@ -512,7 +512,7 @@ test("#810: a large PR's harness budget scales above the tier default, under the
 
 test("#810: a budget-exhausted loop records the exact unread files and leads and persists them", async () => {
   const { root, deps } = workspace();
-  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff (truncated)\n+ change\n");
+  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff\n+ change\n");
   fs.writeFileSync(path.join(root, "pr-files.json"), JSON.stringify([
     { filename: "src/a.ts", status: "modified", additions: 1, deletions: 0, changes: 1 },
     { filename: "src/b.ts", status: "modified", additions: 1, deletions: 0, changes: 1 },
@@ -567,7 +567,7 @@ test("#921: a docs PR whose small files are fully in the corpus lists only the t
   fs.writeFileSync(path.join(root, CORPUS_DIFF_SECTION_ARTIFACT), section);
   fs.writeFileSync(
     path.join(root, "review-corpus.truncated.md"),
-    `# Repository Standards and Conventions (AGENTS.md)\n\n# PR Diff (truncated)\n\`\`\`diff\n${section}\`\`\`\n\n# Tool Harness Findings\n\nnone\n`,
+    `# Repository Standards and Conventions (AGENTS.md)\n\n# PR Diff\n\`\`\`diff\n${section}\`\`\`\n\n# Tool Harness Findings\n\nnone\n`,
   );
   fs.writeFileSync(path.join(root, "pr-files.json"), JSON.stringify([
     { filename: "docs/new-guide.md", status: "added", additions: 3, deletions: 0, changes: 3 },
@@ -608,7 +608,7 @@ test("#930: the smart-tier harness consumes the smart-named sidecar", async () =
   fs.writeFileSync(path.join(root, CORPUS_DIFF_SECTION_SMART_ARTIFACT), section);
   fs.writeFileSync(
     path.join(root, "review-corpus.smart.truncated.md"),
-    `# PR Diff (truncated)\n\`\`\`diff\n${section}\`\`\`\n\n# Tool Harness Findings\n\nnone\n`,
+    `# PR Diff\n\`\`\`diff\n${section}\`\`\`\n\n# Tool Harness Findings\n\nnone\n`,
   );
   fs.writeFileSync(path.join(root, "pr-files.json"), JSON.stringify([
     { filename: "docs/new-guide.md", status: "added", additions: 3, deletions: 0, changes: 3 },
@@ -630,7 +630,7 @@ test("#930: the smart-tier harness consumes the smart-named sidecar", async () =
 
 test("#810: a model-chosen stop leaves no partial-coverage record", async () => {
   const { root, deps } = workspace();
-  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff (truncated)\n+ change\n");
+  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff\n+ change\n");
   fs.writeFileSync(path.join(root, "pr-files.json"), JSON.stringify([
     { filename: "src/a.ts", status: "modified", additions: 1, deletions: 0, changes: 1 },
     { filename: "src/b.ts", status: "modified", additions: 1, deletions: 0, changes: 1 },
@@ -675,7 +675,7 @@ test("#847: buildToolLoopTelemetry folds the #810 size signal into the budget ob
 
 test("#847: a size-scaled run persists route/budget/source/size, stop reason and calls used in tool-harness.json", async () => {
   const { root, deps } = workspace();
-  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff (truncated)\n+ change\n");
+  fs.writeFileSync(path.join(root, "review-corpus.truncated.md"), "# PR Diff\n+ change\n");
   fs.writeFileSync(path.join(root, "pr.json"), JSON.stringify({ changedFiles: 54, additions: 4346, deletions: 181 }));
   fs.writeFileSync(path.join(root, "src.ts"), "export const x = 1;\n");
   const scripted = [openAiCall("c1", "read_file", '{"path":"src.ts"}'), openAiText("evidence gathered"), validVerdict()];
