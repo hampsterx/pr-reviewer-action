@@ -623,6 +623,9 @@ export async function runPrecheck(spec: PrecheckSpec): Promise<PrecheckOutput> {
   if (!shouldReview) {
     if (skipReason === "diff-unchanged") {
       const carried = carriedVerdict(lastCommentBody);
+      // One marker parse for both readers below: the #812 CI-stale
+      // re-check and the #975 head acceptance.
+      const carriedMarker = parseMetadata(lastCommentBody);
       // ── #812: the stale carried verdict ──────────────────────────────
       // A carried request_changes binds to the external-CI conclusion the
       // review saw (required-check coverage is not recomputed here). When
@@ -637,9 +640,8 @@ export async function runPrecheck(spec: PrecheckSpec): Promise<PrecheckOutput> {
       if (carried?.verdict === "request_changes") {
         const readAdapter = spec.adapter as Partial<PlatformReadAdapter>;
         if (typeof readAdapter.externalChecks === "function") {
-          const marker = parseMetadata(lastCommentBody);
-          const storedCiState = typeof marker?.ci_state === "string" ? marker.ci_state : "";
-          const headSha = typeof marker?.head_sha === "string" ? marker.head_sha : "";
+          const storedCiState = typeof carriedMarker?.ci_state === "string" ? carriedMarker.ci_state : "";
+          const headSha = typeof carriedMarker?.head_sha === "string" ? carriedMarker.head_sha : "";
           // Fail closed: a marker without a usable head binding (or without
           // a stored state) cannot PROVE the verdict-relevant inputs
           // unchanged — "none" is a real recorded conclusion too, and
@@ -675,6 +677,15 @@ export async function runPrecheck(spec: PrecheckSpec): Promise<PrecheckOutput> {
         output.review_result = carried.reviewResult;
         output.degradedGateBypass = carried.degradedGateBypass;
         if (carried.incompleteReason !== undefined) output.incomplete_reason = carried.incompleteReason;
+        // #975: name the head whose review recorded the carried findings,
+        // for the carried-pointer line downstream. The marker's head_sha is
+        // untrusted comment content: only a commit-sha-shaped value (7-64
+        // hex digits, case-insensitive) is ever accepted; anything else
+        // leaves `head_sha` empty and the pointer says `<unknown>`.
+        const markerHead = typeof carriedMarker?.head_sha === "string" ? carriedMarker.head_sha : "";
+        if (/^[0-9a-f]{7,64}$/i.test(markerHead)) {
+          output.head_sha = markerHead;
+        }
       }
       return output;
     }

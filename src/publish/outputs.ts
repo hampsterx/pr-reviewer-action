@@ -13,6 +13,129 @@
  * orchestrator supplies the telemetry objects the v2 pipeline scraped from
  * run artifacts. Rows render only when their data is supplied.
  */
+import { sanitizeMarkdown, type UpstreamLinkMode } from "./sanitize.js";
+import { redactText } from "../context/redact.js";
+import { escapeTableCell } from "../gates/ci-wait.js";
+import { SEVERITY_LABELS } from "./inline-findings.js";
+
+// ---------------------------------------------------------------------------
+// Findings summary (moved from publish.ts, #975): the per-finding table a
+// reader sees in place of bare counts, shared by the strict publish body and
+// the step summary.
+// ---------------------------------------------------------------------------
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Rows rendered before the visible "N more" cap keeps the body bounded
+ * (50 findings of up to 2000 characters each would overrun a comment). */
+export const FINDINGS_SUMMARY_MAX_ROWS = 50;
+
+const SEVERITY_RANK = ["blocker", "major", "minor", "info"] as const;
+
+/** Per-severity counts in rank order, zero entries omitted: `2 major, 4 minor`. */
+export function severityCountsLabel(findings: unknown): string {
+  if (!Array.isArray(findings)) return "";
+  const counts = new Map<string, number>();
+  for (const finding of findings) {
+    const severity = isRecord(finding) && typeof finding.severity === "string"
+      ? finding.severity
+      : "info";
+    counts.set(severity, (counts.get(severity) ?? 0) + 1);
+  }
+  const ordered = [
+    ...SEVERITY_RANK.filter((severity) => counts.has(severity)),
+    ...[...counts.keys()].filter((severity) => !(SEVERITY_RANK as readonly string[]).includes(severity)).sort(),
+  ];
+  return ordered.map((severity) => `${counts.get(severity)} ${severity}`).join(", ");
+}
+
+/** Wrap an already-escaped body in a fence-safe inline-code span: the
+ * delimiter is one backtick longer than the longest backtick run inside the
+ * body, so embedded backticks (escaped to `\`` by `escapeTableCell`) or
+ * Markdown link syntax cannot close the span and render clickable. Same
+ * fail-closed strategy as `inlineCodeValue` (#903).
+ *
+ * A backtick-bearing body is additionally SPACE-PADDED (`delim + " " + body
+ * + " " + delim`). Without the padding, a trailing escaped backtick runs
+ * straight into the closing delimiter and merges with it into a longer run
+ * (the 1-backtick escape + the 2-backtick fence = a 3-run) that no
+ * CommonMark/GFM parser accepts as the equal-length closing delimiter, so
+ * the span is left unterminated and the payload renders as live Markdown.
+ * CommonMark strips exactly one leading+trailing space, so the visible span
+ * content is unchanged. A backtick-free body stays an unpadded single-backtick
+ * fence, byte-identical to `inlineCodeValue`. */
+function fenceInlineCode(body: string): string {
+  if (!body.includes("`")) return `\`${body}\``;
+  const longest = Math.max(0, ...(body.match(/`+/g) ?? []).map((run) => run.length));
+  const delim = "`".repeat(longest + 1);
+  return `${delim} ${body} ${delim}`;
+}
+
+/** A path (model-controlled) as one bounded code span: whitespace collapsed
+ * and fenced by a backtick run longer than any inside it, so it cannot open
+ * markdown structure; pipes are escaped because GFM tables split cells even
+ * inside code spans. */
+function locationCell(finding: Record<string, unknown>): string {
+  const file = typeof finding.file === "string" ? finding.file : "";
+  const line = typeof finding.line === "number" && Number.isFinite(finding.line) ? String(finding.line) : "";
+  if (file === "" && line === "") return "";
+  const raw = file === "" ? line : line === "" ? file : `${file}:${line}`;
+  return fenceInlineCode(escapeTableCell(raw.replace(/\s+/g, " ").trim()));
+}
+
+/**
+ * The `### Findings (…)` section: one row per normalized still-open finding
+ * — severity, `file:line` (or `file`, or blank), message — the same array
+ * the verdict was decided on, so the body is the one place a reader sees the
+ * whole set. Messages get redact_text, upstream-link neutralization,
+ * whitespace collapse, a length cap, and table-cell escaping; a hostile
+ * message cannot split the row or forge headings. Returns "" when there is
+ * nothing to render.
+ *
+ * Per-surface policy for the message cell (#975 / #988): the strict
+ * published body (publish.ts) calls this with no opts, keeping the operator's
+ * `upstream-link-mode` (linkMode) rendering verbatim; the step summary
+ * (renderStepSummary) passes `messageAsInlineCode: true` and additionally
+ * fences each non-empty message in a code span, so model-controlled Markdown
+ * links/autolinks (e.g. `[x](https://evil.example)`) can never render
+ * clickable. Maintainer review on PR #988 (head 43a0808); same fail-closed
+ * rationale as `inlineCodeValue` (#903).
+ */
+export function renderFindingsSummary(
+  findings: unknown,
+  linkMode: UpstreamLinkMode,
+  opts?: { messageAsInlineCode?: boolean },
+): string {
+  if (!Array.isArray(findings)) return "";
+  const rows = findings.filter((item): item is Record<string, unknown> => isRecord(item));
+  if (rows.length === 0) return "";
+  const counts = severityCountsLabel(rows);
+  const lines = [
+    `### Findings${counts ? ` (${counts})` : ""}`,
+    "",
+    "| Severity | Location | Finding |",
+    "| --- | --- | --- |",
+  ];
+  for (const finding of rows.slice(0, FINDINGS_SUMMARY_MAX_ROWS)) {
+    const rawSeverity = typeof finding.severity === "string" ? finding.severity : "info";
+    const label = Object.hasOwn(SEVERITY_LABELS, rawSeverity) ? SEVERITY_LABELS[rawSeverity]! : rawSeverity;
+    const body = escapeTableCell(
+      sanitizeMarkdown(redactText(String(finding.message ?? "")), linkMode)
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 300),
+    );
+    // #988: fence only non-empty messages; an empty message stays an empty cell.
+    const message = opts?.messageAsInlineCode === true && body !== "" ? fenceInlineCode(body) : body;
+    lines.push(`| ${escapeTableCell(label)} | ${locationCell(finding)} | ${message} |`);
+  }
+  if (rows.length > FINDINGS_SUMMARY_MAX_ROWS) {
+    lines.push("", `_…and ${rows.length - FINDINGS_SUMMARY_MAX_ROWS} more finding(s) not listed._`);
+  }
+  return `\n\n${lines.join("\n")}\n`;
+}
 
 export const REVIEW_STEP_OUTPUT_IDS = [
   "verdict",
@@ -188,6 +311,15 @@ export interface StepSummaryTelemetry {
   findingsCount: number;
   blockersCount: number;
   requiredChecksStatus: string;
+  /** #975: normalized still-open findings rendered as a table below the
+   * counts row; empty/absent renders nothing (byte-identical to the v2 table). */
+  findings?: unknown;
+  /** #975: upstream-link neutralization for finding messages, mirroring the
+   * strict publish body's link mode. The step summary additionally fences each
+   * non-empty message cell in an inline-code span (see `renderFindingsSummary`)
+   * so model-controlled Markdown links/autolinks can never render clickable on
+   * this surface, independent of the link-mode choice. */
+  upstreamLinkMode?: UpstreamLinkMode;
   requirementCoverage?: { total: number; unknown: number };
   primaryTools: HarnessSummaryTelemetry;
   smartTools?: HarnessSummaryTelemetry;
@@ -282,5 +414,6 @@ export function renderStepSummary(telemetry: StepSummaryTelemetry): string {
   rows.push(`| Completion tokens | ${telemetry.completionTokens} |`);
 
   const lines = ["### AI PR Review", "", "| Field | Value |", "| --- | --- |", ...rows, ""];
-  return lines.join("\n");
+  const block = renderFindingsSummary(telemetry.findings ?? [], telemetry.upstreamLinkMode ?? "inert", { messageAsInlineCode: true });
+  return lines.join("\n") + block;
 }
