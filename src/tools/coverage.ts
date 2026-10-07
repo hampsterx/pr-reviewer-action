@@ -221,7 +221,7 @@ function rawDiffChunks(rawDiff: string): Map<string, string> {
  * section, or no corpus was assembled) credits nothing. The payload — not
  * the rendered corpus document — is the only thing searched, because
  * sections assembled before the diff (changed manifests) are
- * repository-controlled and can forge a `# PR Diff (truncated)` heading
+ * repository-controlled and can forge a `# PR Diff` heading
  * with a planted copy of any file's diff; trusting rendered headings would
  * let untrusted content erase a coverage gap (#252 trust-boundary class).
  * Chunk boundaries anchor at real `diff --git` line starts in both the raw

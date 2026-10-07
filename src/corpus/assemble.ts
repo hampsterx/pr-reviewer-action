@@ -385,7 +385,7 @@ export function buildReviewCorpus(
     // into "not verified".
     pushSection("# CI Check Results", bytes(ws.ciChecksContent));
   }
-  pushSection("# PR Files (truncated)", filesContent, "json");
+  pushSection("# PR Files", filesContent, "json");
   pushSection(
     "# Version Hints from Diff",
     ws.versionHintsTruncatedTxt !== null ? bytes(ws.versionHintsTruncatedTxt) : enc("(none)\n"),
@@ -398,7 +398,7 @@ export function buildReviewCorpus(
   // trusted to locate it — untrusted sections assembled earlier (changed
   // manifests) can forge any heading.
   const diffSectionBytes = concat(
-    enc("# PR Diff (truncated)\n"),
+    enc("# PR Diff\n"),
     enc("```diff\n"),
     diffContent,
     enc("```\n\n"),

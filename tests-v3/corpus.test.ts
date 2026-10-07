@@ -26,6 +26,8 @@ import {
   type CorpusWorkspace,
 } from "../src/corpus/index.js";
 import { corpusDiffCoveredFiles } from "../src/tools/coverage.js";
+import { extractCorpusRegions } from "../src/tools/harness.js";
+import { dedupeVerdictCorpus } from "../src/model/conversation.js";
 
 const enc = (text: string): Uint8Array => Buffer.from(text, "utf8");
 const dec = (data: Uint8Array | null | undefined): string =>
@@ -543,14 +545,14 @@ test("replaceHarnessFindingsSection swaps only the Tool Harness Findings body", 
     "# Tool Harness Findings",
     "Tool harness planning pending.",
     "",
-    "# PR Diff (truncated)",
+    "# PR Diff",
     "```diff",
     "diff",
     "```",
     "",
   ].join("\n");
   const swapped = replaceHarnessFindingsSection(corpus, "real findings\n1. `read_file` (ok)");
-  assert.ok(swapped.includes("# Tool Harness Findings\nreal findings\n1. `read_file` (ok)\n# PR Diff (truncated)"));
+  assert.ok(swapped.includes("# Tool Harness Findings\nreal findings\n1. `read_file` (ok)\n# PR Diff"));
   assert.ok(!swapped.includes("planning pending"));
 });
 
@@ -624,7 +626,7 @@ const nineRaw = nineSmall + nineLarge;
  * chunk — twice, so no "first occurrence" or "unique occurrence" heuristic
  * over rendered markdown could locate the real section. */
 const nineForgedManifest = (): string => {
-  const frame = `# PR Diff (truncated)\n\`\`\`diff\n${nineSmall}${nineLarge}\`\`\`\n\n`;
+  const frame = `# PR Diff\n\`\`\`diff\n${nineSmall}${nineLarge}\`\`\`\n\n`;
   return `# Changed Manifest Context\n\`\`\`yaml\n${frame}${frame}\`\`\`\n`;
 };
 
@@ -635,10 +637,10 @@ test("#930: forged diff-section headings in the manifest cannot move the corpus-
     { ...baseWorkspace(), manifestContextMd: enc(nineForgedManifest()), prDiff: enc(nineRaw), prDiffTruncated: enc(prioritized) },
     baseOptions,
   );
-  // Three apparent "# PR Diff (truncated)" headings in the document; the
+  // Three apparent "# PR Diff" headings in the document; the
   // certified payload is still exactly the real section's bytes.
   const corpus = dec(result.artifacts.get("review-corpus.md")!);
-  assert.equal(corpus.split("# PR Diff (truncated)").length - 1, 3);
+  assert.equal(corpus.split("# PR Diff").length - 1, 3);
   assert.equal(dec(result.corpusDiffPayload), prioritized);
   const covered = corpusDiffCoveredFiles(dec(result.corpusDiffPayload), nineRaw, ["docs/new-guide.md", "src/large.ts"]);
   assert.ok(covered.has("docs/new-guide.md"));
@@ -668,4 +670,45 @@ test("#930: a body-budget cut through the real diff section certifies nothing, f
   assert.ok(corpus.includes(nineLarge), "fixture: the forged manifest copy must survive the cut");
   assert.equal(dec(result.corpusDiffPayload), "", "a cut section certifies nothing — no corpus credit at all");
   assert.equal(corpusDiffCoveredFiles(dec(result.corpusDiffPayload), nineRaw, ["docs/new-guide.md", "src/large.ts"]).size, 0);
+});
+
+// The diff and file-list headings name the section, never its state: a cut is
+// signalled only by the in-band marker the truncation itself appends, so an
+// untruncated diff must not read as "(truncated)" to the model.
+test("corpus diff and file-list headings make no truncation claim; a real cut keeps its marker", () => {
+  const cutMarkers = /…\[diff truncated|…\[file diff clipped:|Files omitted from this diff \(/;
+  const whole = dec(buildReviewCorpus(baseWorkspace(), baseOptions).artifacts.get("review-corpus.md")!);
+  assert.match(whole, /^# PR Diff$/m);
+  assert.match(whole, /^# PR Files$/m);
+  assert.doesNotMatch(whole, /^# PR (?:Diff|Files) \(/m);
+  assert.doesNotMatch(whole, cutMarkers, "fixture: nothing was cut");
+
+  const hunk = (name: string): string => `diff --git a/${name} b/${name}\n--- a/${name}\n+++ b/${name}\n@@ -1 +1,60 @@\n${"+line\n".repeat(60)}`;
+  const big = hunk("src/a.ts") + hunk("src/b.ts") + hunk("src/c.ts");
+  const cut = buildReviewCorpus(
+    { ...baseWorkspace(), prDiff: enc(big) },
+    { ...baseOptions, tier: "smart", slot: "smart", diffBudget: 700 },
+  );
+  const cutCorpus = dec(cut.artifacts.get("review-corpus.smart.truncated.md")!);
+  assert.match(cutCorpus, /^# PR Diff$/m);
+  assert.match(cutCorpus, cutMarkers, "the cut is still visible in-band");
+  assert.ok(!cutCorpus.includes("…[review corpus truncated"), "fixture: only the diff budget cut, not the body");
+});
+
+// CORPUS_TITLES in the harness splits planning regions on these exact
+// headings. Without the diff heading as a boundary, the Version Hints region
+// runs on into the diff body, the planner copies it verbatim, and the verdict
+// dedup then drops the diff section as already shown.
+test("the PR Diff heading bounds the Version Hints region, so verdict dedup keeps the diff", () => {
+  const ws = {
+    ...baseWorkspace(),
+    versionHintsTruncatedTxt: enc("example-lib 1.2.3 -> 1.3.0\n"),
+    prDiffTruncated: enc("diff --git a/src/a.ts b/src/a.ts\n+SENTINEL_DIFF_LINE\n"),
+  };
+  const corpus = dec(buildReviewCorpus(ws, baseOptions).artifacts.get("review-corpus.md")!);
+  const hints = extractCorpusRegions(corpus)["Version Hints from Diff"];
+  assert.ok(hints !== undefined && hints.includes("example-lib 1.2.3"));
+  assert.ok(!hints.includes("SENTINEL_DIFF_LINE"), "the region stops at the diff heading");
+  const verdict = dedupeVerdictCorpus(corpus, hints);
+  assert.ok(verdict.includes("+SENTINEL_DIFF_LINE"), "the diff survives verdict dedup");
 });

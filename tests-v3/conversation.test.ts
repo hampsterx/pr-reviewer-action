@@ -136,7 +136,7 @@ test("dedupeVerdict_corpus drops only byte-identical sections and preserves Rela
     "# Related Code (truncated)",
     "more refs",
     "",
-    "# PR Diff (truncated)",
+    "# PR Diff",
     "+line",
   ].join("\n");
   const planning = ["# PR Classification", "kind: app_code"].join("\n");
