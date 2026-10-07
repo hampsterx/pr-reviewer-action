@@ -151,6 +151,47 @@ test("runs the full review end to end: artifacts, outputs, marker", async () => 
   }
 });
 
+test("#975: the step summary renders the findings table and counts for a findings verdict", async () => {
+  const server = await startMockServer((_req, _body, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(verdictBody(baseVerdict({
+      findings: [
+        { id: "f1", severity: "blocker", file: "prom/rules.yml", line: 12, message: "rule drops alerts" },
+        { id: "f2", severity: "minor", file: "README.md", line: 4, message: "typo" },
+      ],
+    })));
+  });
+  const { runDir, cleanup } = withRunDir();
+  try {
+    const outputFile = join(runDir, "gh-output.txt");
+    const stepSummaryFile = join(runDir, "step-summary.md");
+    await runReview({
+      env: { GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: stepSummaryFile },
+      inputs: {
+        "github-token": "tok",
+        repo: "o/r",
+        "pr-number": "7",
+        "ai-base-url": server.url,
+        "ai-model": "m",
+        "ai-stream": "false",
+        "ai-api-key": "k",
+      },
+      runDir,
+      workspace: runDir,
+      platformAdapter: mockPlatform(),
+      persistArtifacts: true,
+      quiet: true,
+    });
+    const stepSummary = readFileSync(stepSummaryFile, "utf8");
+    assert.ok(stepSummary.includes("### Findings"), "the findings section renders in the step summary");
+    assert.ok(stepSummary.includes("prom/rules.yml:12"), "the blocker finding's location renders");
+    assert.ok(stepSummary.includes("| Findings | 2 (blockers: 1) |"), "the counts row reflects the open findings");
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
 async function runVerificationThreadVerdict(
   modelVerdict: Record<string, unknown>,
   options: { policy?: string; threadBody?: string } = {},

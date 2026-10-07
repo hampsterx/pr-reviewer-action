@@ -49,8 +49,9 @@ import { buildModelRequest } from "../model/request.js";
 import { callModelTier, type TierProfile } from "../model/call.js";
 import { parseVerdictResponse } from "../model/verdict.js";
 import { annotateAnalysisEngine, analysisEngineBase, buildUserMessage, handleModelFailure, MODEL_UNAVAILABLE_ENGINE, publicAnalysisEngine, applySystemPromptFragments, applySpecialistLeadsFragment, applySupersededDiscussionFragment, applyRequirementTraceFragment, resolveSystemPrompt, workspaceAt, type PromptWorkspace } from "../prompt/index.js";
-import { reviewArtifactFromParsed } from "../enforcement/artifact.js";
-import { applyStrictVerdictPolicy, applyVerdictPolicy, relaxVerificationOnlyVerdict } from "../enforcement/verdict-policy.js";
+import { reviewArtifactFromParsed, type ArtifactFinding } from "../enforcement/artifact.js";
+import { applyStrictVerdictPolicy, applyVerdictPolicy, relaxCiOnlyVerdict, relaxVerificationOnlyVerdict } from "../enforcement/verdict-policy.js";
+import { capCiEvidenceFindings } from "../enforcement/ci-evidence.js";
 import { markerReviewResult } from "../publish/publish.js";
 import type { PartialCoverage } from "../tools/coverage.js";
 import { applyRequiredCheckValidation } from "../enforcement/completeness.js";
@@ -994,6 +995,11 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
 
   // ── Enforcement (review.sh) + requirement coverage ───────────────────
   const reviewRecord = (artifact ?? {}) as Record<string, unknown>;
+  const ciChecksContent = ciChecksBytes(env);
+  const ciChecksMarkdown = ciChecksContent === null ? null : Buffer.from(ciChecksContent).toString("utf8");
+  if (Array.isArray(reviewRecord.findings)) {
+    capCiEvidenceFindings(reviewRecord.findings as ArtifactFinding[], ciChecksMarkdown);
+  }
   const verdictPolicy = env.VERDICT_POLICY ?? "strict";
   // Captured before any layer mutates it: the strict mapping (#811) takes the
   // model verdict as an input, not as the final answer.
@@ -1056,9 +1062,10 @@ export async function runReview(options: RunReviewOptions): Promise<RunReviewRes
     // still-open finding is a verification ask and no independent
     // deterministic gate fired. The overlays above have already run, so
     // their blocks are visible here.
-    relaxVerificationOnlyVerdict(reviewRecord as never, {
-      forced: failClosedEnforcementFired(enforcementInputs),
-    });
+    const forced = failClosedEnforcementFired(enforcementInputs)
+      || (completenessResult.status === "incomplete" && completenessResult.mode === "fail");
+    relaxVerificationOnlyVerdict(reviewRecord as never, { forced });
+    relaxCiOnlyVerdict(reviewRecord as never, { forced });
     // #977: the relaxation can flip the model's request_changes to approve
     // after the enforcement banner was written; reconcile the markdown with
     // the final verdict.
@@ -1875,6 +1882,8 @@ function writeStepSummary(stepSummaryPath: string, input: SummaryInput): void {
     verdictSource: input.outputs.verdictSource,
     findingsCount: findings.length,
     blockersCount: findings.filter((f) => (f as { severity?: string }).severity === "blocker").length,
+    findings,
+    upstreamLinkMode: upstreamLinkModeFromEnv(env),
     requiredChecksStatus: input.outputs.requiredChecks,
     ...(total > 0 ? { requirementCoverage: { total, unknown } } : {}),
     primaryTools: {
@@ -1948,6 +1957,14 @@ function byteLength(bytes: Uint8Array | null | undefined): number {
 
 function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
+}
+
+/** #975: mirror of `entrypoints.ts`' upstream-link-mode normalization — the
+ * step-summary findings table neutralizes links exactly like the published
+ * body does. */
+function upstreamLinkModeFromEnv(env: StageEnv): "inert" | "togithub" {
+  const value = (env.UPSTREAM_LINK_MODE ?? "").trim().toLowerCase();
+  return value === "togithub" ? "togithub" : "inert";
 }
 
 function numberAt(record: unknown, key: string): number | null {

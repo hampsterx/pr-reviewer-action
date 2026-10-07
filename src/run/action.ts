@@ -12,6 +12,7 @@ import { stageEnvFromConfig } from "./env.js";
 import { buildAdapter, buildPublishApi, publishInputFromEnv, publishWith, readEvent, type StepEvent } from "./entrypoints.js";
 import { rawInputsFromEnv, runReview } from "./review.js";
 import { createRunDir } from "./run-dir.js";
+import { blockingGateSummary, escapeWorkflowData, renderBlockingAnnotations } from "./blocking-findings.js";
 
 export { createRunDir };
 
@@ -182,12 +183,14 @@ export async function actionMain(env: NodeJS.ProcessEnv = process.env): Promise<
       await postForkPrCommentReply(stage).catch(() => undefined);
     }
     await maybeClearRereviewLabel(stage, event);
-    return failOnRequestChanges(
-      stage,
-      pre.verdict ?? "",
-      pre.degradedGateBypass === true,
-      (stage.FAIL_ON_DEGRADED_REVIEW ?? "false").toLowerCase() === "true",
-    );
+    // #975: a carried request_changes verdict means the last review — of
+    // `pre.head_sha`, trusted precheck metadata — already recorded the
+    // findings; this run has none of its own, so nothing is carried as
+    // findings, and the pointer names the run to look at.
+    const carriedPointer = pre.verdict === "request_changes"
+      ? `The verdict was carried from the review of ${pre.head_sha !== "" ? pre.head_sha : "<unknown>"}; its findings are in that run's step summary.`
+      : "";
+    return failOnRequestChanges(stage, pre.verdict ?? "", pre.degradedGateBypass === true, (stage.FAIL_ON_DEGRADED_REVIEW ?? "false").toLowerCase() === "true", "", carriedPointer);
   }
 
   // #914: an accepted comment-command re-review gets an immediate 👀 ack
@@ -274,11 +277,33 @@ export async function actionMain(env: NodeJS.ProcessEnv = process.env): Promise<
     review.outputs.verdict,
     review.outputs.degradedGateBypass,
     (stage.FAIL_ON_DEGRADED_REVIEW ?? "false").toLowerCase() === "true",
+    review.outputs.findings,
+    "",
   );
   return publishFailed ? Math.max(gate, 1) : gate;
 }
 
-export function failOnRequestChanges(stage: Env, verdict: string, degradedGateBypassEligible = false, failOnDegraded = false): number {
+/** #975: the fail-on-request-changes gate. Exported for tests (the
+ * blocking-finding renderer it calls is pure — see
+ * `./blocking-findings.ts`). A blocking verdict writes the blocking
+ * findings FIRST, as `::error file=...::` workflow-command annotations, so
+ * they land on the failed check and the Files tab; then the gate line
+ * itself, whose one-line summary names the blocking count and the first
+ * finding. `carriedPointer` (a run skipped by precheck that carries a
+ * `request_changes` verdict from an earlier review — this run recorded no
+ * findings of its own) is appended, space-separated, to BOTH the gate line
+ * and the step summary, so the (otherwise empty) summary still points at
+ * the run whose findings explain the failure. A degraded-review-eligible
+ * `request_changes` verdict (fallback with no evidence, or a model-failure
+ * notice) warns and returns 0 unless `failOnDegraded` is set. */
+export function failOnRequestChanges(
+  stage: Env,
+  verdict: string,
+  degradedGateBypassEligible = false,
+  failOnDegraded = false,
+  findingsJson = "",
+  carriedPointer = "",
+): number {
   if ((stage.FAIL_ON_REQUEST_CHANGES ?? "false").toLowerCase() !== "true") return 0;
   if (verdict !== "request_changes") {
     process.stdout.write(`Final verdict is '${verdict || "<none>"}'; not blocking (fail-on-request-changes=true).\n`);
@@ -288,7 +313,41 @@ export function failOnRequestChanges(stage: Env, verdict: string, degradedGateBy
     process.stdout.write("::warning::Final verdict is request_changes, but this review is eligible for the degraded gate bypass (fallback with no evidence, or model-failure notice); not blocking (fail-on-request-changes=true, fail-on-degraded-review=false).\n");
     return 0;
   }
-  process.stdout.write("::error::Final verdict is request_changes; failing the step (fail-on-request-changes=true).\n");
+  let parsed: unknown = [];
+  if (findingsJson !== "") {
+    try {
+      const value = JSON.parse(findingsJson);
+      if (Array.isArray(value)) parsed = value;
+    } catch {
+      parsed = [];
+    }
+  }
+  for (const line of renderBlockingAnnotations(parsed)) {
+    process.stdout.write(line + "\n");
+  }
+  const summary = blockingGateSummary(parsed);
+  // `blockingGateSummary` returns "" only when no blocker/major finding
+  // exists at all — a locationless blocker still counts there.
+  const gate = summary !== "" ? summary : "no blocker/major finding was recorded";
+  const suffix = carriedPointer !== "" ? ` ${carriedPointer}` : "";
+  // The finding text is model-controlled, so both surfaces get their own
+  // escaping: control-character flattening keeps every rendered string one
+  // line, `escapeWorkflowData` on the command data (percent LAST would
+  // re-encode, so it runs percent-first inside the helper) stops a literal
+  // `%0A`/`%25` surviving into the runner's decode as a forged newline or
+  // command, and the Markdown step summary gets the file's fence-safe
+  // `inlineCodeValue` code span — one line, and it cannot open a link,
+  // heading, or fence (#903 precedent for untrusted text on this surface).
+  // `sanitizeMarkdown(..., "inert")` used to be this fence, but its inert
+  // mode is an identity for non-GitHub markdown links, so a hostile
+  // `](https://…)` payload stayed a clickable untrusted link on the
+  // summary.
+  const message = `fail-on-request-changes=true and the final verdict is request_changes: ${gate}${suffix}`
+    .replace(/[\u0000-\u001f\u007f]+/g, " ");
+  process.stdout.write(`::error::${escapeWorkflowData(message)}\n`);
+  if (carriedPointer !== "") {
+    appendStepSummary(stage, `**AI PR Review failed:** ${inlineCodeValue(message)}`);
+  }
   return 1;
 }
 
