@@ -139,7 +139,7 @@ node dist/index.js publish      → sanitize → strip markers → managed body 
 7. Linked Issue Context (from Fixes/Closes references in PR body and optional configured Linear identifiers in PR titles)
 8. PR Files (JSON file list without patches; past 100 files a `note` entry says so, and a byte-budget cut appends `…[file list truncated]`)
 9. Version Hints from Diff
-10. PR Diff (prioritized; a cut appends `…[diff truncated to fit context budget]` and a `Files omitted from this diff (…)` manifest, and a partly kept file ends in `…[file diff clipped: N more bytes]`)
+10. PR Diff (prioritized; a cut appends `…[diff truncated to fit context budget]`, normally followed by a `Files omitted from this diff (…)` manifest, and a partly kept file ends in `…[file diff clipped: N more bytes]`. A budget too small for the marker gets up to three dots instead, and a zero budget nothing)
 11. Tool Harness Findings (planned + executed tool results)
 12. Evidence Providers (user-defined command output)
 13. Image Digest Provenance
