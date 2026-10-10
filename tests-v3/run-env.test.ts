@@ -16,7 +16,7 @@ import { stageEnvFromConfig, buildStageEnv, validateStageEnv, type RunContext } 
 import { buildHumanReviewsSection } from "../src/run/stages.js";
 import { RunWorkspace } from "../src/run/workspace.js";
 import { rawInputsFromEnv } from "../src/run/review.js";
-import { collectConfigLines } from "../src/precheck/fingerprint.js";
+import { collectConfigLines, computeConfigHash } from "../src/precheck/fingerprint.js";
 
 /**
  * The kebab→SCREAMING_SNAKE projection the orchestrator feeds the ported
@@ -243,6 +243,14 @@ test("#1020: smart-tier round and wall-clock inputs reach resolveLoopLimits from
     const stage = stageFor(runnerEnv({ "smart-tool-max-rounds": "5", "smart-tool-loop-wall-clock-sec": "120" }));
     assert.ok(collectConfigLines(stage).includes("SMART_TOOL_MAX_ROUNDS=5"));
   });
+  // A longer loop can finish more rounds, so a wall-clock change on an
+  // unchanged diff has to re-review rather than skip as already reviewed.
+  for (const id of ["tool-loop-wall-clock-sec", "smart-tool-loop-wall-clock-sec"]) {
+    await t.test(`changing ${id} changes the config hash`, () => {
+      const hashOf = (value: string) => computeConfigHash(collectConfigLines(stageFor(runnerEnv({ [id]: value }))));
+      assert.notEqual(hashOf("120"), hashOf("900"));
+    });
+  }
 });
 
 test("#928: env-only stage knobs survive buildStageEnv, so blind replays really skip human reviews", async () => {
