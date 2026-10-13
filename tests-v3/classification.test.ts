@@ -1610,6 +1610,7 @@ test("#1034: self-location readlink no longer fires symlink_sensitive", () => {
     ["python identifier containing readlink", "tools/tool.py", ["+readlink_result = os.readlink(__file__)"]],
     ["shell identifier containing readlink", "scripts/run.sh", ['+my_readlink="$(readlink "$0")"']],
     ["dirname with a /lib suffix", "scripts/run.sh", ['+LIB="$(dirname "$(readlink -f "$0")")/lib"']],
+    ["dirname with a /.. suffix", "scripts/run.sh", ['+ROOT="$(dirname "$(readlink -f "$0")")/.."']],
     // Ordinary neighbours in the same file.
     ["Path(__file__) beside the python loop", "tools/tool.py", ["+ROOT = Path(__file__).parent", ...PY_SELF_LOCATION_LOOP]],
     ["strict mode beside the shell loop", "scripts/run.sh", ["+set -euo pipefail", ...SH_SELF_LOCATION_LOOP]],
@@ -1630,14 +1631,17 @@ test("#1034: self-location readlink no longer fires symlink_sensitive", () => {
     assert.ok(!firesSymlinkSensitive(result), `${label}: unexpected symlink_sensitive`);
   }
 
-  // A `/..` suffix still fires traversal_literal, a separate class; only the
+  // A `../` suffix still fires traversal_literal, a separate class; only the
   // readlink stops counting.
-  const parent = classifyPr({
+  const sibling = classifyPr({
     prFiles: files("scripts/run.sh"),
-    diffText: selfLocationDiff("scripts/run.sh", ['+ROOT="$(dirname "$(readlink -f "$0")")/.."']),
+    diffText: selfLocationDiff("scripts/run.sh", ['+LIB="$(dirname "$(readlink -f "$0")")/../lib"']),
     linkedIssues: [],
   });
-  assert.ok(!firesSymlinkSensitive(parent));
+  assert.ok(!firesSymlinkSensitive(sibling));
+  assert.ok(sibling.pathHandlingProvenance.signals.some(
+    (s) => s.signal === "traversal_literal" && s.source === "diff",
+  ));
 });
 
 test("#1034: real symlink surfaces and near-miss self-location shapes keep firing", () => {
