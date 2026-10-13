@@ -438,21 +438,26 @@ function selfLocationFamilies(path: string | null): SelfLocationFamilies {
 /** Identifiers are bounded so a pathological name fails to match rather than
  * costing time. */
 const SELF_LOCATION_IDENT = String.raw`[A-Za-z_]\w{0,63}`;
-const SH_ANCHOR = String.raw`"(?:\$0|\$\{BASH_SOURCE\[0\]\})"`;
+const SH_ANCHOR_WORD = String.raw`(?:\$0|\$\{BASH_SOURCE\[0\]\})`;
+const SH_ANCHOR = String.raw`"${SH_ANCHOR_WORD}"`;
 const SH_READLINK_ANCHOR = String.raw`readlink[ \t]+(?:-f[ \t]+)?${SH_ANCHOR}`;
 /** A literal path after the resolved directory (`")/.."`, `")/lib"`): plain
  * path characters only, bounded. */
 const SH_PATH_SUFFIX = String.raw`(?:/[\w.-]{0,64}){0,8}`;
+const SH_DIRNAME_ANCHOR = String.raw`\$\(dirname[ \t]+"\$\(${SH_READLINK_ANCHOR}\)"\)${SH_PATH_SUFFIX}`;
 
 /** Whole-statement direct forms. Python: `[NAME =] os.readlink(__file__)`.
  * Shell: `readlink [-f] A`, `NAME="$(readlink [-f] A)"`,
  * `NAME="$(dirname "$(readlink [-f] A)")"`, `cd "$(dirname "$(readlink [-f] A)")"`,
- * with A a quoted `$0` or `${BASH_SOURCE[0]}` and an optional `local`. */
+ * with A a quoted `$0` or `${BASH_SOURCE[0]}` and an optional `local`. An
+ * assignment's right-hand side is not word-split, so its outer quotes are
+ * optional, as a matched pair (`("?)...\N`); the shell loop lines take the
+ * same rule. */
 const PY_DIRECT_STATEMENT = new RegExp(
   String.raw`^[ \t]*(?:${SELF_LOCATION_IDENT}[ \t]*=[ \t]*)?os\.readlink[ \t]*\([ \t]*__file__[ \t]*(?:,[ \t]*)?\)[ \t]*$`,
 );
 const SH_DIRECT_STATEMENT = new RegExp(
-  String.raw`^[ \t]*(?:${SH_READLINK_ANCHOR}|(?:local[ \t]+)?${SELF_LOCATION_IDENT}="\$\(${SH_READLINK_ANCHOR}\)"|(?:(?:local[ \t]+)?${SELF_LOCATION_IDENT}=|cd[ \t]+)"\$\(dirname[ \t]+"\$\(${SH_READLINK_ANCHOR}\)"\)${SH_PATH_SUFFIX}")[ \t]*$`,
+  String.raw`^[ \t]*(?:${SH_READLINK_ANCHOR}|(?:local[ \t]+)?${SELF_LOCATION_IDENT}=("?)\$\(${SH_READLINK_ANCHOR}\)\1|(?:local[ \t]+)?${SELF_LOCATION_IDENT}=("?)${SH_DIRNAME_ANCHOR}\2|cd[ \t]+"${SH_DIRNAME_ANCHOR}")[ \t]*$`,
 );
 
 /** Python loop template lines; indentation is captured and compared as text. */
@@ -465,15 +470,15 @@ const PY_LOOP_UPDATE = new RegExp(
 );
 
 /** Shell loop template lines. */
-const SH_LOOP_ANCHOR = new RegExp(String.raw`^[ \t]*(${SELF_LOCATION_IDENT})=${SH_ANCHOR}[ \t]*$`);
+const SH_LOOP_ANCHOR = new RegExp(String.raw`^[ \t]*(${SELF_LOCATION_IDENT})=("?)${SH_ANCHOR_WORD}\2[ \t]*$`);
 const SH_LOOP_GUARD = new RegExp(
   String.raw`^[ \t]*while[ \t]+(?:\[[ \t]+-[Lh][ \t]+"\$(${SELF_LOCATION_IDENT})"[ \t]+\]|\[\[[ \t]+-[Lh][ \t]+"\$(${SELF_LOCATION_IDENT})"[ \t]+\]\])[ \t]*;[ \t]*do[ \t]*$`,
 );
 const SH_LOOP_READ = new RegExp(
-  String.raw`^[ \t]*(${SELF_LOCATION_IDENT})="\$\(readlink[ \t]+"\$(${SELF_LOCATION_IDENT})"\)"[ \t]*$`,
+  String.raw`^[ \t]*(${SELF_LOCATION_IDENT})=("?)\$\(readlink[ \t]+"\$(${SELF_LOCATION_IDENT})"\)\2[ \t]*$`,
 );
 const SH_LOOP_COPY = new RegExp(
-  String.raw`^[ \t]*(${SELF_LOCATION_IDENT})="\$(${SELF_LOCATION_IDENT})"[ \t]*$`,
+  String.raw`^[ \t]*(${SELF_LOCATION_IDENT})=("?)\$(${SELF_LOCATION_IDENT})\2[ \t]*$`,
 );
 const SH_LOOP_DONE = /^[ \t]*done[ \t]*$/;
 
@@ -511,8 +516,8 @@ function shellSelfLocationLoop(codes: readonly string[], k: number): number | nu
   if (!anchor || !guard || !read || !copy || !SH_LOOP_DONE.test(codes[k + 4] ?? "")) return null;
   const ident = anchor[1] ?? "";
   const link = read[1] ?? "";
-  if (link === ident || (guard[1] ?? guard[2]) !== ident || read[2] !== ident) return null;
-  return copy[1] === ident && copy[2] === link ? k + 2 : null;
+  if (link === ident || (guard[1] ?? guard[2]) !== ident || read[3] !== ident) return null;
+  return copy[1] === ident && copy[3] === link ? k + 2 : null;
 }
 
 /** Lines whose `readlink` is a recognised self-location read. A direct

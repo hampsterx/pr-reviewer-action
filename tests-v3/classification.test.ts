@@ -1609,6 +1609,13 @@ test("#1034: self-location readlink no longer fires symlink_sensitive", () => {
     ["python trailing comma", "tools/tool.py", ["+HERE = os.readlink(__file__,)"]],
     ["python identifier containing readlink", "tools/tool.py", ["+readlink_result = os.readlink(__file__)"]],
     ["shell identifier containing readlink", "scripts/run.sh", ['+my_readlink="$(readlink "$0")"']],
+    ["unquoted assignment", "scripts/run.sh", ['+SCRIPT=$(readlink -f "$0")']],
+    ["unquoted dirname assignment", "scripts/run.sh", ['+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")']],
+    [
+      "shell loop with unquoted assignments",
+      "scripts/run.sh",
+      ["+_src=${BASH_SOURCE[0]}", '+while [ -L "$_src" ]; do', '+  _link=$(readlink "$_src")', "+  _src=$_link", "+done"],
+    ],
     ["dirname with a /lib suffix", "scripts/run.sh", ['+LIB="$(dirname "$(readlink -f "$0")")/lib"']],
     ["dirname with a /.. suffix", "scripts/run.sh", ['+ROOT="$(dirname "$(readlink -f "$0")")/.."']],
     // Ordinary neighbours in the same file.
