@@ -1654,6 +1654,9 @@ test("#1034: real symlink surfaces and near-miss self-location shapes keep firin
     ["shell reassignment", "scripts/run.sh", ['+src="${BASH_SOURCE[0]}"', '+src="$1"', '+readlink "$src"']],
     // Ordinary near-misses.
     ["python loop body with a second statement", "tools/tool.py", [...PY_SELF_LOCATION_LOOP, "+    hops += 1"]],
+    ["python loop reads another variable", "tools/tool.py", ["+src = __file__", "+while os.path.islink(src):", "+    src = os.readlink(user_path)"]],
+    ["shell loop reads another variable", "scripts/run.sh", SH_SELF_LOCATION_LOOP.map((l) => l.replace('readlink "$_src"', 'readlink "$target"'))],
+    ["shell loop copies another variable", "scripts/run.sh", SH_SELF_LOCATION_LOOP.map((l) => l.replace('_src="$_link"', '_src="$target"'))],
     ["statement between anchor and guard", "scripts/run.sh", [SH_SELF_LOCATION_LOOP[0] ?? "", '+_src="$1"', ...SH_SELF_LOCATION_LOOP.slice(1)]],
     ["second readlink on the line, shell", "scripts/run.sh", ['+readlink "$0"; readlink "$1"']],
     ["second readlink on the line, python", "tools/tool.py", ["+x = os.readlink(__file__) or os.readlink(p)"]],
