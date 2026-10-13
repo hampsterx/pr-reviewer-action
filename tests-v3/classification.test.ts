@@ -1666,6 +1666,7 @@ test("#1034: real symlink surfaces and near-miss self-location shapes keep firin
     ["shell loop copies another variable", "scripts/run.sh", SH_SELF_LOCATION_LOOP.map((l) => l.replace('_src="$_link"', '_src="$target"'))],
     ["statement between anchor and guard", "scripts/run.sh", [SH_SELF_LOCATION_LOOP[0] ?? "", '+_src="$1"', ...SH_SELF_LOCATION_LOOP.slice(1)]],
     ["second readlink on the line, shell", "scripts/run.sh", ['+readlink "$0"; readlink "$1"']],
+    ["unbalanced outer quote", "scripts/run.sh", ['+SCRIPT="$(readlink -f "$0")']],
     ["second readlink on the line, python", "tools/tool.py", ["+x = os.readlink(__file__) or os.readlink(p)"]],
     ["anchor changed from $0 to $1, loop in context", "scripts/run.sh", modifiedLoopAnchor("$0", "$1")],
     ["anchor changed from $1 to $0, loop in context", "scripts/run.sh", modifiedLoopAnchor("$1", "$0")],
